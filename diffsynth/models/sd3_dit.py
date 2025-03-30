@@ -131,7 +131,7 @@ class JointAttention(torch.nn.Module):
         return q, k, v
 
 
-    def forward(self, hidden_states_a, hidden_states_b):
+    def forward(self, hidden_states_a, hidden_states_b,mask=None):
         batch_size = hidden_states_a.shape[0]
 
         qa, ka, va = self.process_qkv(hidden_states_a, self.a_to_qkv, self.norm_q_a, self.norm_k_a)
@@ -140,7 +140,7 @@ class JointAttention(torch.nn.Module):
         k = torch.concat([ka, kb], dim=2)
         v = torch.concat([va, vb], dim=2)
 
-        hidden_states = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        hidden_states = torch.nn.functional.scaled_dot_product_attention(q, k, v,mask)
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, self.num_heads * self.head_dim)
         hidden_states = hidden_states.to(q.dtype)
         hidden_states_a, hidden_states_b = hidden_states[:, :hidden_states_a.shape[1]], hidden_states[:, hidden_states_a.shape[1]:]
@@ -218,7 +218,7 @@ class DualTransformerBlock(torch.nn.Module):
         )
 
 
-    def forward(self, hidden_states_a, hidden_states_b, temb):
+    def forward(self, hidden_states_a, hidden_states_b, temb,mask):
         norm_hidden_states_a, gate_msa_a, shift_mlp_a, scale_mlp_a, gate_mlp_a, norm_hidden_states_a_2, gate_msa_a_2 = self.norm1_a(hidden_states_a, emb=temb)
         norm_hidden_states_b, gate_msa_b, shift_mlp_b, scale_mlp_b, gate_mlp_b = self.norm1_b(hidden_states_b, emb=temb)
 
@@ -265,7 +265,7 @@ class JointTransformerBlock(torch.nn.Module):
         )
 
 
-    def forward(self, hidden_states_a, hidden_states_b, temb):
+    def forward(self, hidden_states_a, hidden_states_b, temb,mask = None):
         if self.norm1_a.dual:
             norm_hidden_states_a, gate_msa_a, shift_mlp_a, scale_mlp_a, gate_mlp_a, norm_hidden_states_a_2, gate_msa_a_2 = self.norm1_a(hidden_states_a, emb=temb)
         else:
@@ -273,7 +273,7 @@ class JointTransformerBlock(torch.nn.Module):
         norm_hidden_states_b, gate_msa_b, shift_mlp_b, scale_mlp_b, gate_mlp_b = self.norm1_b(hidden_states_b, emb=temb)
 
         # Attention
-        attn_output_a, attn_output_b = self.attn(norm_hidden_states_a, norm_hidden_states_b)
+        attn_output_a, attn_output_b = self.attn(norm_hidden_states_a, norm_hidden_states_b,mask)
 
         # Part A
         hidden_states_a = hidden_states_a + gate_msa_a * attn_output_a
@@ -307,12 +307,12 @@ class JointTransformerFinalBlock(torch.nn.Module):
         )
 
 
-    def forward(self, hidden_states_a, hidden_states_b, temb):
+    def forward(self, hidden_states_a, hidden_states_b, temb,mask= None):
         norm_hidden_states_a, gate_msa_a, shift_mlp_a, scale_mlp_a, gate_mlp_a = self.norm1_a(hidden_states_a, emb=temb)
         norm_hidden_states_b = self.norm1_b(hidden_states_b, emb=temb)
 
         # Attention
-        attn_output_a = self.attn(norm_hidden_states_a, norm_hidden_states_b)
+        attn_output_a = self.attn(norm_hidden_states_a, norm_hidden_states_b,mask)
 
         # Part A
         hidden_states_a = hidden_states_a + gate_msa_a * attn_output_a
@@ -348,15 +348,87 @@ class SD3DiT(torch.nn.Module):
         )
         return hidden_states
 
-    def forward(self, hidden_states, timestep, prompt_emb, pooled_prompt_emb, tiled=False, tile_size=128, tile_stride=64, use_gradient_checkpointing=False):
+    def construct_mask(self, entity_masks, prompt_seq_len, image_seq_len):
+        N = len(entity_masks)
+        batch_size = entity_masks[0].shape[0]
+        total_seq_len = N * prompt_seq_len + image_seq_len
+        patched_masks = [self.patchify(entity_masks[i]) for i in range(N)]
+        attention_mask = torch.ones((batch_size, total_seq_len, total_seq_len), dtype=torch.bool).to(device=entity_masks[0].device)
+
+        image_start = N * prompt_seq_len
+        image_end = N * prompt_seq_len + image_seq_len
+        # prompt-image mask
+        for i in range(N):
+            prompt_start = i * prompt_seq_len
+            prompt_end = (i + 1) * prompt_seq_len
+            image_mask = torch.sum(patched_masks[i], dim=-1) > 0
+            image_mask = image_mask.unsqueeze(1).repeat(1, prompt_seq_len, 1)
+            # prompt update with image
+            attention_mask[:, prompt_start:prompt_end, image_start:image_end] = image_mask
+            # image update with prompt
+            attention_mask[:, image_start:image_end, prompt_start:prompt_end] = image_mask.transpose(1, 2)
+        # prompt-prompt mask
+        for i in range(N):
+            for j in range(N):
+                if i != j:
+                    prompt_start_i = i * prompt_seq_len
+                    prompt_end_i = (i + 1) * prompt_seq_len
+                    prompt_start_j = j * prompt_seq_len
+                    prompt_end_j = (j + 1) * prompt_seq_len
+                    attention_mask[:, prompt_start_i:prompt_end_i, prompt_start_j:prompt_end_j] = False
+
+        attention_mask = attention_mask.float()
+        attention_mask[attention_mask == 0] = float('-inf')
+        attention_mask[attention_mask == 1] = 0
+        return attention_mask
+
+
+    def process_entity_masks(self, hidden_states, prompt_emb, entity_prompt_emb, entity_masks, text_ids):
+        repeat_dim = hidden_states.shape[1]
+        max_masks = 0
+        attention_mask = None
+        prompt_embs = [prompt_emb]
+        
+        if entity_masks is not None:
+            # entity_masks
+            batch_size, max_masks = entity_masks.shape[0], entity_masks.shape[1]
+            max_masks = 1
+            entity_masks = entity_masks.repeat(1, 1, repeat_dim, 1, 1)
+            entity_masks = [entity_masks[:, i, None].squeeze(1) for i in range(max_masks)]
+            # global mask
+            global_mask = torch.ones_like(entity_masks[0]).to(device=hidden_states.device, dtype=hidden_states.dtype)
+            entity_masks = entity_masks + [global_mask] # append global to last
+            # attention mask
+            attention_mask = self.construct_mask(entity_masks, prompt_emb.shape[1], hidden_states.shape[1])
+            attention_mask = attention_mask.to(device=hidden_states.device, dtype=hidden_states.dtype)
+            attention_mask = attention_mask.unsqueeze(1)
+            # embds: n_masks * b * seq * d
+            local_embs = [entity_prompt_emb[:, i, None].squeeze(1) for i in range(max_masks)]
+            prompt_embs = local_embs + prompt_embs # append global to last
+        prompt_embs = [self.context_embedder(prompt_emb) for prompt_emb in prompt_embs]
+        prompt_emb = torch.cat(prompt_embs, dim=1)
+        image_rotary_emb = None#self.pos_embedder(torch.cat((text_ids, image_ids), dim=1))
+        return prompt_emb, image_rotary_emb, attention_mask
+
+    def patchify(self, hidden_states):
+        hidden_states = rearrange(hidden_states, "B C (H P) (W Q) -> B (H W) (C P Q)", P=2, Q=2)
+        return hidden_states
+
+
+    def unpatchify(self, hidden_states, height, width):
+        hidden_states = rearrange(hidden_states, "B (H W) (C P Q) -> B C (H P) (W Q)", P=2, Q=2, H=height//2, W=width//2)
+        return hidden_states
+
+    def forward(self, hidden_states, timestep, prompt_emb, pooled_prompt_emb, tiled=False, tile_size=128, tile_stride=64, use_gradient_checkpointing=False,mask  = None):
         if tiled:
             return self.tiled_forward(hidden_states, timestep, prompt_emb, pooled_prompt_emb, tile_size, tile_stride)
         conditioning = self.time_embedder(timestep, hidden_states.dtype) + self.pooled_text_embedder(pooled_prompt_emb)
         prompt_emb = self.context_embedder(prompt_emb)
 
         height, width = hidden_states.shape[-2:]
+        #print(hidden_states)
         hidden_states = self.pos_embedder(hidden_states)
-
+        #print(hidden_states)
         def create_custom_forward(module):
             def custom_forward(*inputs):
                 return module(*inputs)
@@ -368,6 +440,7 @@ class SD3DiT(torch.nn.Module):
                     create_custom_forward(block),
                     hidden_states, prompt_emb, conditioning,
                     use_reentrant=False,
+                    mask = mask
                 )
             else:
                 hidden_states, prompt_emb = block(hidden_states, prompt_emb, conditioning)

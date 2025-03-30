@@ -3,7 +3,12 @@ from ..prompters import SD3Prompter
 from ..schedulers import FlowMatchScheduler
 from .base import BasePipeline
 import torch
+import torch.nn.functional as F
+import numpy as np
 from tqdm import tqdm
+from PIL import Image
+from copy import deepcopy
+from einops import rearrange
 
 
 
@@ -69,7 +74,48 @@ class SD3ImagePipeline(BasePipeline):
     def prepare_extra_input(self, latents=None):
         return {}
     
+    def preprocess_masks(self, masks, height, width, dim):
+        out_masks = []
+        for mask in masks:
+            #mask = self.preprocess_image(mask.resize((width, height), resample=Image.NEAREST)).mean(dim=1, keepdim=True) > 0
+            mask = F.interpolate(mask.unsqueeze(0), size=(height, width,3), mode='nearest').squeeze(0).squeeze(0)
+            d = mask.device
+            mask = np.array(mask.cpu())
+            
+            mask = self.preprocess_image(mask).mean(dim=1, keepdim=True) > 0
+            mask = mask.repeat(1, dim, 1, 1).to(device=self.device, dtype=self.torch_dtype)
+            out_masks.append(mask)
+        return out_masks
 
+
+    def prepare_entity_inputs(self, entity_prompts, entity_masks, width, height, t5_sequence_length=512, enable_eligen_inpaint=False):
+        fg_mask, bg_mask = None, None
+        if enable_eligen_inpaint:
+            masks_ = deepcopy(entity_masks)
+            fg_masks = torch.cat([self.preprocess_image(mask.resize((width//8, height//8))).mean(dim=1, keepdim=True) for mask in masks_])
+            fg_masks = (fg_masks > 0).float()
+            fg_mask = fg_masks.sum(dim=0, keepdim=True).repeat(1, 16, 1, 1) > 0
+            bg_mask = ~fg_mask
+        entity_masks = self.preprocess_masks(entity_masks, height//8, width//8, 1)
+        entity_masks = torch.cat(entity_masks, dim=0).unsqueeze(0) # b, n_mask, c, h, w
+        #print(entity_prompts,"##########################################")
+        entity_prompts = self.encode_prompt(entity_prompts, t5_sequence_length=t5_sequence_length)['prompt_emb'].unsqueeze(0)
+        return entity_prompts, entity_masks, fg_mask, bg_mask
+
+    def prepare_eligen(self, prompt_emb_nega, eligen_entity_prompts, eligen_entity_masks, width, height, t5_sequence_length, enable_eligen_inpaint, enable_eligen_on_negative, cfg_scale):
+        if eligen_entity_masks is not None:
+            entity_prompt_emb_posi, entity_masks_posi, fg_mask, bg_mask = self.prepare_entity_inputs(eligen_entity_prompts, eligen_entity_masks, width, height, t5_sequence_length, enable_eligen_inpaint)
+            if enable_eligen_on_negative and cfg_scale != 1.0:
+                entity_prompt_emb_nega = prompt_emb_nega['prompt_emb'].unsqueeze(1).repeat(1, entity_masks_posi.shape[1], 1, 1)
+                entity_masks_nega = entity_masks_posi
+            else:
+                entity_prompt_emb_nega, entity_masks_nega = None, None
+        else:
+            entity_prompt_emb_posi, entity_masks_posi, entity_prompt_emb_nega, entity_masks_nega = None, None, None, None
+            fg_mask, bg_mask = None, None
+        eligen_kwargs_posi = {"entity_prompt_emb": entity_prompt_emb_posi, "entity_masks": entity_masks_posi}
+        eligen_kwargs_nega = {"entity_prompt_emb": entity_prompt_emb_nega, "entity_masks": entity_masks_nega}
+        return eligen_kwargs_posi, eligen_kwargs_nega, fg_mask, bg_mask
     @torch.no_grad()
     def __call__(
         self,
@@ -80,6 +126,11 @@ class SD3ImagePipeline(BasePipeline):
         negative_prompt="",
         cfg_scale=7.5,
         input_image=None,
+         # EliGen
+        eligen_entity_prompts=None,
+        eligen_entity_masks=None,
+        enable_eligen_on_negative=False,
+        enable_eligen_inpaint=False,
         denoising_strength=1.0,
         height=1024,
         width=1024,
@@ -111,10 +162,23 @@ class SD3ImagePipeline(BasePipeline):
             latents = self.generate_noise((1, 16, height//8, width//8), seed=seed, device=self.device, dtype=self.torch_dtype)
 
         # Encode prompts
+        t5_sequence_length = 77
         self.load_models_to_device(['text_encoder_1', 'text_encoder_2', 'text_encoder_3'])
+        masks = ()
+        mask_scales = ()
+        prompt, local_prompts, masks, mask_scales = self.extend_prompt(prompt, local_prompts, masks, mask_scales)
         prompt_emb_posi = self.encode_prompt(prompt, positive=True, t5_sequence_length=t5_sequence_length)
         prompt_emb_nega = self.encode_prompt(negative_prompt, positive=False, t5_sequence_length=t5_sequence_length)
         prompt_emb_locals = [self.encode_prompt(prompt_local, t5_sequence_length=t5_sequence_length) for prompt_local in local_prompts]
+
+        #prompt_emb = self.encode_prompt(prompt, positive=True,t5_sequence_length=512)
+        #prompt_emb_nega = self.encode_prompt( negative_prompt, positive=False, t5_sequence_length=512)
+        eligen_kwargs_posi, eligen_kwargs_nega, fg_mask, bg_mask = self.prepare_eligen(prompt_emb_nega, eligen_entity_prompts, eligen_entity_masks, width, height, 77, False, False, 3.5)
+
+        ## Eligen prepare
+        #print(t5_sequence_length)
+
+        eligen_kwargs_posi, eligen_kwargs_nega, fg_mask, bg_mask = self.prepare_eligen(prompt_emb_nega, eligen_entity_prompts, eligen_entity_masks, width, height, t5_sequence_length, False, False, cfg_scale)
 
         # Denoise
         self.load_models_to_device(['dit'])
@@ -126,6 +190,19 @@ class SD3ImagePipeline(BasePipeline):
                 latents, timestep=timestep, **prompt_emb_posi, **tiler_kwargs,
             )
             noise_pred_posi = self.control_noise_via_local_prompts(prompt_emb_posi, prompt_emb_locals, masks, mask_scales, inference_callback)
+            
+            ### controlled denoising
+            if cfg_scale != 1.0:
+                # Negative side
+                noise_pred_nega = lets_dance_sd3(
+                    dit=self.dit,
+                    hidden_states=latents, timestep=timestep,
+                    **prompt_emb_nega,  **eligen_kwargs_nega,
+                )
+                noise_pred = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
+            else:
+                noise_pred = noise_pred_posi
+            
             noise_pred_nega = self.dit(
                 latents, timestep=timestep, **prompt_emb_nega, **tiler_kwargs,
             )
@@ -145,3 +222,46 @@ class SD3ImagePipeline(BasePipeline):
         # offload all models
         self.load_models_to_device([])
         return image
+
+
+def lets_dance_sd3(
+    dit,
+    hidden_states=None,
+    timestep=None,
+    prompt_emb=None,
+    pooled_prompt_emb=None,
+    guidance=None,
+    text_ids=None,
+    entity_prompt_emb=None,
+    entity_masks=None,
+    **kwargs
+):
+    
+    conditioning = dit.time_embedder(timestep, hidden_states.dtype) + dit.pooled_text_embedder(pooled_prompt_emb)
+    #prompt_emb = dit.context_embedder(prompt_emb)
+
+    height, width = hidden_states.shape[-2:]
+    hidden_states = dit.pos_embedder(hidden_states)
+
+    
+    if entity_prompt_emb is not None and entity_masks is not None:
+        prompt_emb, image_rotary_emb, attention_mask = dit.process_entity_masks(hidden_states, prompt_emb, entity_prompt_emb, entity_masks, text_ids)
+    else:
+        prompt_emb = dit.context_embedder(prompt_emb)
+        image_rotary_emb = None#dit.pos_embedder(torch.cat((text_ids), dim=1))
+        attention_mask = None
+
+    
+    def create_custom_forward(module):
+        def custom_forward(*inputs):
+            return module(*inputs)
+        return custom_forward
+    
+    for block in dit.blocks:
+        #print("1",block)
+       hidden_states, prompt_emb = block(hidden_states, prompt_emb, conditioning)
+    
+    hidden_states = dit.norm_out(hidden_states, conditioning)
+    hidden_states = dit.proj_out(hidden_states)
+    hidden_states = rearrange(hidden_states, "B (H W) (P Q C) -> B C (H P) (W Q)", P=2, Q=2, H=height//2, W=width//2)
+    return hidden_states
