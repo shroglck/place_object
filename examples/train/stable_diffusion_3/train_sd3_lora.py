@@ -1,9 +1,55 @@
 from diffsynth import ModelManager, SD3ImagePipeline
 from diffsynth.trainers.text_to_image import LightningModelForT2ILoRA, add_general_parsers, launch_training_task
 import torch, os, argparse
+from einops import rearrange
+
 os.environ["TOKENIZERS_PARALLELISM"] = "True"
 
+def lets_dance_sd3(
+    dit,
+    hidden_states=None,
+    timestep=None,
+    prompt_emb=None,
+    pooled_prompt_emb=None,
+    guidance=None,
+    text_ids=None,
+    entity_prompt_emb=None,
+    entity_masks=None,
+    **kwargs
+):
+    
+    conditioning = dit.time_embedder(timestep, hidden_states.dtype) + dit.pooled_text_embedder(pooled_prompt_emb)
+    #prompt_emb = dit.context_embedder(prompt_emb)
 
+    height, width = hidden_states.shape[-2:]
+    hidden_states = dit.pos_embedder(hidden_states)
+
+    #print("################",hidden_states.shape,entity_prompt_emb.shape,entity_masks.shape,prompt_emb.shape)
+    if entity_prompt_emb is not None and entity_masks is not None:
+        prompt_emb, image_rotary_emb, attention_mask = dit.process_entity_masks(hidden_states, prompt_emb, entity_prompt_emb, entity_masks, text_ids)
+    else:
+        prompt_emb = dit.context_embedder(prompt_emb)
+        image_rotary_emb = None#dit.pos_embedder(torch.cat((text_ids), dim=1))
+        attention_mask = None
+
+    #print(attention_mask.shape,hidden_states.shape,prompt_emb.shape,conditioning.shape)
+    def create_custom_forward(module):
+        def custom_forward(*inputs):
+            return module(*inputs)
+        return custom_forward
+    
+    for block in dit.blocks:
+        #print("1",block)
+       hidden_states, prompt_emb = block(hidden_states, prompt_emb, conditioning,mask = attention_mask)
+    
+    hidden_states = dit.norm_out(hidden_states, conditioning)
+    hidden_states = dit.proj_out(hidden_states)
+    hidden_states = rearrange(hidden_states, "B (H W) (P Q C) -> B C (H P) (W Q)", P=2, Q=2, H=height//2, W=width//2)
+    return hidden_states
+
+    
+
+    
 class LightningModel(LightningModelForT2ILoRA):
     def __init__(
         self,
@@ -32,6 +78,66 @@ class LightningModel(LightningModelForT2ILoRA):
             init_lora_weights=init_lora_weights,
             pretrained_lora_path=pretrained_lora_path,
         )
+        self.total_loss =0
+        self.step = 0
+    
+    def training_step(self, batch, batch_idx):
+        # Data
+        self.step +=1
+        text, image = batch["text"], batch["image"]
+        entity_masks = batch["entity_mask"]
+        
+        #entity_prompts =[iii[0] for iii in batch["entity_prompt"] if iii[0] != '']
+        entity_prompts = []
+        entity_masks = []
+        for o,iii in enumerate(batch["entity_prompt"]):
+            if iii[0]!='':
+                entity_prompts.append(iii[0])
+                entity_masks.append(batch["entity_mask"][o])
+
+        #print(entity_prompts)
+        height,width = 1024,1024
+        # Prepare input parameters
+        #print(entity_prompts)
+        self.pipe.device = self.device
+        prompt_emb = self.pipe.encode_prompt(text, positive=True,t5_sequence_length=77)
+        prompt_emb_nega = self.pipe.encode_prompt( "", positive=False, t5_sequence_length=77)
+        #print(prompt_emb["prompt_emb"].shape,"##############")
+        eligen_kwargs_posi, eligen_kwargs_nega, fg_mask, bg_mask = self.pipe.prepare_eligen(prompt_emb_nega, entity_prompts, entity_masks, width, height, 77, False, False, 3.5)
+
+
+
+        if "latents" in batch:
+            latents = batch["latents"].to(dtype=self.pipe.torch_dtype, device=self.device)
+        else:
+            latents = self.pipe.vae_encoder(image.to(dtype=self.pipe.torch_dtype, device=self.device))
+        #    print(latents.shape)
+        noise = torch.randn_like(latents)
+        timestep_id = torch.randint(0, self.pipe.scheduler.num_train_timesteps, (1,))
+        timestep = self.pipe.scheduler.timesteps[timestep_id].to(self.device)
+        extra_input = self.pipe.prepare_extra_input(latents)
+        noisy_latents = self.pipe.scheduler.add_noise(latents, noise, timestep)
+        training_target = self.pipe.scheduler.training_target(latents, noise, timestep)
+
+        # Compute loss
+        
+        noise_pred = lets_dance_sd3(
+                    dit=self.pipe.denoising_model(),
+                    hidden_states=latents, timestep=timestep,
+                    **prompt_emb,**extra_input, **eligen_kwargs_posi,
+                )#self.pipe.denoising_model()(
+            #noisy_latents, timestep=timestep, **prompt_emb, **extra_input,
+           # use_gradient_checkpointing=self.use_gradient_checkpointing
+        #)
+        loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
+        loss = loss * self.pipe.scheduler.training_weight(timestep)
+        self.total_loss += loss
+        # Record log
+        self.log("train_loss", self.total_loss/self.step, prog_bar=True)
+        if (self.step+1)%1000==0:
+            self.step = 0
+            self.total_loss = 0
+        return loss
 
 
 def parse_args():
