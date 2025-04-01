@@ -266,12 +266,13 @@ class JointTransformerBlock(torch.nn.Module):
 
 
     def forward(self, hidden_states_a, hidden_states_b, temb,mask = None):
+        #print(hidden_states_a.shape,hidden_states_b.shape,mask.shape)
         if self.norm1_a.dual:
             norm_hidden_states_a, gate_msa_a, shift_mlp_a, scale_mlp_a, gate_mlp_a, norm_hidden_states_a_2, gate_msa_a_2 = self.norm1_a(hidden_states_a, emb=temb)
         else:
             norm_hidden_states_a, gate_msa_a, shift_mlp_a, scale_mlp_a, gate_mlp_a = self.norm1_a(hidden_states_a, emb=temb)
         norm_hidden_states_b, gate_msa_b, shift_mlp_b, scale_mlp_b, gate_mlp_b = self.norm1_b(hidden_states_b, emb=temb)
-
+        #print(norm_hidden_states_a.shape,norm_hidden_states_b.shape)
         # Attention
         attn_output_a, attn_output_b = self.attn(norm_hidden_states_a, norm_hidden_states_b,mask)
 
@@ -350,6 +351,7 @@ class SD3DiT(torch.nn.Module):
 
     def construct_mask(self, entity_masks, prompt_seq_len, image_seq_len):
         N = len(entity_masks)
+        #print(prompt_seq_len,image_seq_len)
         batch_size = entity_masks[0].shape[0]
         total_seq_len = N * prompt_seq_len + image_seq_len
         patched_masks = [self.patchify(entity_masks[i]) for i in range(N)]
@@ -388,11 +390,11 @@ class SD3DiT(torch.nn.Module):
         max_masks = 0
         attention_mask = None
         prompt_embs = [prompt_emb]
-        
+        #print("#################",entity_masks.shape,entity_prompt_emb.shape)
         if entity_masks is not None:
             # entity_masks
             batch_size, max_masks = entity_masks.shape[0], entity_masks.shape[1]
-            max_masks = 1
+            #max_masks = 10
             entity_masks = entity_masks.repeat(1, 1, repeat_dim, 1, 1)
             entity_masks = [entity_masks[:, i, None].squeeze(1) for i in range(max_masks)]
             # global mask

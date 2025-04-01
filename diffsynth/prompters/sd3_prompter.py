@@ -75,19 +75,23 @@ class SD3Prompter(BasePrompter):
         # CLIP
         pooled_prompt_emb_1, prompt_emb_1 = self.encode_prompt_using_clip(prompt, self.text_encoder_1, self.tokenizer_1, 77, device)
         pooled_prompt_emb_2, prompt_emb_2 = self.encode_prompt_using_clip(prompt, self.text_encoder_2, self.tokenizer_2, 77, device)
+        #print(prompt_emb_1.shape,prompt_emb_2.shape)
         # T5
         if self.text_encoder_3 is None:
             prompt_emb_3 = torch.zeros((prompt_emb_1.shape[0], t5_sequence_length, 4096), dtype=prompt_emb_1.dtype, device=device)
         else:
-            prompt_emb_3 = self.encode_prompt_using_t5(prompt, self.text_encoder_3, self.tokenizer_3, t5_sequence_length, device)
+            prompt_emb_3 = self.encode_prompt_using_t5(prompt, self.text_encoder_3, self.tokenizer_3, 77, device)
             prompt_emb_3 = prompt_emb_3.to(prompt_emb_1.dtype) # float32 -> float16
 
         # Merge
+        #print(prompt_emb_3.shape)
         prompt_emb_3 = prompt_emb_3.repeat(prompt_emb_1.shape[0],1,1)
+        #print(prompt_emb_3.shape,"##########$^^^^^^^^^^^^")
         prompt_emb = torch.cat([
             torch.nn.functional.pad(torch.cat([prompt_emb_1, prompt_emb_2], dim=-1), (0, 4096 - 768 - 1280)),
             prompt_emb_3
         ], dim=-2)
+        #print(prompt_emb.shape,prompt_emb_3.shape,"##########$^^^^^^^^^^^^")
         pooled_prompt_emb = torch.cat([pooled_prompt_emb_1, pooled_prompt_emb_2], dim=-1)
 
         return prompt_emb, pooled_prompt_emb

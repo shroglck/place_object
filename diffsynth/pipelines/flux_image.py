@@ -588,6 +588,7 @@ def lets_dance_flux(
     height, width = hidden_states.shape[-2:]
     hidden_states = dit.patchify(hidden_states)
     hidden_states = dit.x_embedder(hidden_states)
+    #print(hidden_states.shape,prompt_emb.shape,entity_prompt_emb.shape)
 
     if entity_prompt_emb is not None and entity_masks is not None:
         prompt_emb, image_rotary_emb, attention_mask = dit.process_entity_masks(hidden_states, prompt_emb, entity_prompt_emb, entity_masks, text_ids, image_ids)
@@ -595,18 +596,19 @@ def lets_dance_flux(
         prompt_emb = dit.context_embedder(prompt_emb)
         image_rotary_emb = dit.pos_embedder(torch.cat((text_ids, image_ids), dim=1))
         attention_mask = None
-
     # TeaCache
     if tea_cache is not None:
         tea_cache_update = tea_cache.check(dit, hidden_states, conditioning)
     else:
         tea_cache_update = False
-
+    #print(hidden_states.shape,prompt_emb.shape,attention_mask.shape)
+    
     if tea_cache_update:
         hidden_states = tea_cache.update(hidden_states)
     else:
         # Joint Blocks
         for block_id, block in enumerate(dit.blocks):
+            #print(hidden_states.shape)
             hidden_states, prompt_emb = block(
                 hidden_states,
                 prompt_emb,
@@ -615,7 +617,8 @@ def lets_dance_flux(
                 attention_mask,
                 ipadapter_kwargs_list=ipadapter_kwargs_list.get(block_id, None)
             )
-            # ControlNet
+            # Contr
+            # olNet
             if controlnet is not None and controlnet_frames is not None:
                 hidden_states = hidden_states + controlnet_res_stack[block_id]
 

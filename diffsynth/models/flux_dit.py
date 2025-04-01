@@ -244,10 +244,13 @@ class FluxSingleTransformerBlock(torch.nn.Module):
 
 
     def forward(self, hidden_states_a, hidden_states_b, temb, image_rotary_emb, attn_mask=None, ipadapter_kwargs_list=None):
+        #print("###########",hidden_states_a.shape,hidden_states_b.shape,attn_mask.shape)
+
         residual = hidden_states_a
         norm_hidden_states, gate = self.norm(hidden_states_a, emb=temb)
         hidden_states_a = self.to_qkv_mlp(norm_hidden_states)
         attn_output, mlp_hidden_states = hidden_states_a[:, :, :self.dim * 3], hidden_states_a[:, :, self.dim * 3:]
+        #print(attn_output.shape,hidden_states_a.shape,hidden_states_b.shape,attn_mask.shape)
 
         attn_output = self.process_attention(attn_output, image_rotary_emb, attn_mask, ipadapter_kwargs_list)
         mlp_hidden_states = torch.nn.functional.gelu(mlp_hidden_states, approximate="tanh")
@@ -339,6 +342,7 @@ class FluxDiT(torch.nn.Module):
 
 
     def construct_mask(self, entity_masks, prompt_seq_len, image_seq_len):
+        #print(prompt_seq_len,image_seq_len)
         N = len(entity_masks)
         batch_size = entity_masks[0].shape[0]
         total_seq_len = N * prompt_seq_len + image_seq_len
@@ -378,6 +382,7 @@ class FluxDiT(torch.nn.Module):
         max_masks = 0
         attention_mask = None
         prompt_embs = [prompt_emb]
+        print(hidden_states.shape,prompt_emb.shape,entity_prompt_emb.shape,entity_masks.shape)
         if entity_masks is not None:
             # entity_masks
             batch_size, max_masks = entity_masks.shape[0], entity_masks.shape[1]
@@ -395,7 +400,7 @@ class FluxDiT(torch.nn.Module):
             prompt_embs = local_embs + prompt_embs # append global to last
         prompt_embs = [self.context_embedder(prompt_emb) for prompt_emb in prompt_embs]
         prompt_emb = torch.cat(prompt_embs, dim=1)
-
+        print(prompt_emb.shape)
         # positional embedding
         text_ids = torch.cat([text_ids] * (max_masks + 1), dim=1)
         image_rotary_emb = self.pos_embedder(torch.cat((text_ids, image_ids), dim=1))
@@ -429,7 +434,7 @@ class FluxDiT(torch.nn.Module):
         height, width = hidden_states.shape[-2:]
         hidden_states = self.patchify(hidden_states)
         hidden_states = self.x_embedder(hidden_states)
-
+        #print(prompt_emb.shape,hidden_states.shape)
         if entity_prompt_emb is not None and entity_masks is not None:
             prompt_emb, image_rotary_emb, attention_mask = self.process_entity_masks(hidden_states, prompt_emb, entity_prompt_emb, entity_masks, text_ids, image_ids)
         else:
@@ -441,7 +446,7 @@ class FluxDiT(torch.nn.Module):
             def custom_forward(*inputs):
                 return module(*inputs)
             return custom_forward
-
+        #print(prompt_emb.shape,hidden_states.shape,attention_mask.shape)
         for block in self.blocks:
             if self.training and use_gradient_checkpointing:
                 hidden_states, prompt_emb = torch.utils.checkpoint.checkpoint(

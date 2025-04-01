@@ -99,7 +99,8 @@ class SD3ImagePipeline(BasePipeline):
         entity_masks = self.preprocess_masks(entity_masks, height//8, width//8, 1)
         entity_masks = torch.cat(entity_masks, dim=0).unsqueeze(0) # b, n_mask, c, h, w
         #print(entity_prompts,"##########################################")
-        entity_prompts = self.encode_prompt(entity_prompts, t5_sequence_length=t5_sequence_length)['prompt_emb'].unsqueeze(0)
+        entity_prompts = torch.cat([self.encode_prompt(tt, t5_sequence_length=77)['prompt_emb'] for tt in entity_prompts],dim=0).unsqueeze(0)
+        #print(entity_prompts.shape,"******")
         return entity_prompts, entity_masks, fg_mask, bg_mask
 
     def prepare_eligen(self, prompt_emb_nega, eligen_entity_prompts, eligen_entity_masks, width, height, t5_sequence_length, enable_eligen_inpaint, enable_eligen_on_negative, cfg_scale):
@@ -113,8 +114,10 @@ class SD3ImagePipeline(BasePipeline):
         else:
             entity_prompt_emb_posi, entity_masks_posi, entity_prompt_emb_nega, entity_masks_nega = None, None, None, None
             fg_mask, bg_mask = None, None
+        
         eligen_kwargs_posi = {"entity_prompt_emb": entity_prompt_emb_posi, "entity_masks": entity_masks_posi}
         eligen_kwargs_nega = {"entity_prompt_emb": entity_prompt_emb_nega, "entity_masks": entity_masks_nega}
+        #print(eligen_kwargs_posi)
         return eligen_kwargs_posi, eligen_kwargs_nega, fg_mask, bg_mask
     @torch.no_grad()
     def __call__(
@@ -173,13 +176,13 @@ class SD3ImagePipeline(BasePipeline):
 
         #prompt_emb = self.encode_prompt(prompt, positive=True,t5_sequence_length=512)
         #prompt_emb_nega = self.encode_prompt( negative_prompt, positive=False, t5_sequence_length=512)
-        eligen_kwargs_posi, eligen_kwargs_nega, fg_mask, bg_mask = self.prepare_eligen(prompt_emb_nega, eligen_entity_prompts, eligen_entity_masks, width, height, 77, False, False, 3.5)
-
+        eligen_kwargs_posi, eligen_kwargs_nega, fg_mask, bg_mask = self.prepare_eligen(prompt_emb_nega, eligen_entity_prompts, eligen_entity_masks, width, height, 77, False, True, 3.5)
+        #print(eligen_kwargs_posi,eligen_kwargs_nega)
         ## Eligen prepare
         #print(t5_sequence_length)
 
-        eligen_kwargs_posi, eligen_kwargs_nega, fg_mask, bg_mask = self.prepare_eligen(prompt_emb_nega, eligen_entity_prompts, eligen_entity_masks, width, height, t5_sequence_length, False, False, cfg_scale)
-
+        #eligen_kwargs_posi, eligen_kwargs_nega, fg_mask, bg_mask = self.prepare_eligen(prompt_emb_nega, eligen_entity_prompts, eligen_entity_masks, width, height, t5_sequence_length, False, False, cfg_scale)
+        
         # Denoise
         self.load_models_to_device(['dit'])
         for progress_id, timestep in enumerate(progress_bar_cmd(self.scheduler.timesteps)):
@@ -243,7 +246,7 @@ def lets_dance_sd3(
     height, width = hidden_states.shape[-2:]
     hidden_states = dit.pos_embedder(hidden_states)
 
-    
+    #print(hidden_states.shape,entity_prompt_emb,entity_masks)
     if entity_prompt_emb is not None and entity_masks is not None:
         prompt_emb, image_rotary_emb, attention_mask = dit.process_entity_masks(hidden_states, prompt_emb, entity_prompt_emb, entity_masks, text_ids)
     else:
@@ -251,7 +254,7 @@ def lets_dance_sd3(
         image_rotary_emb = None#dit.pos_embedder(torch.cat((text_ids), dim=1))
         attention_mask = None
 
-    
+    #print(attention_mask.shape,hidden_states.shape,prompt_emb.shape,conditioning.shape)
     def create_custom_forward(module):
         def custom_forward(*inputs):
             return module(*inputs)
@@ -259,7 +262,7 @@ def lets_dance_sd3(
     
     for block in dit.blocks:
         #print("1",block)
-       hidden_states, prompt_emb = block(hidden_states, prompt_emb, conditioning)
+       hidden_states, prompt_emb = block(hidden_states, prompt_emb, conditioning,mask = attention_mask)
     
     hidden_states = dit.norm_out(hidden_states, conditioning)
     hidden_states = dit.proj_out(hidden_states)
