@@ -1,7 +1,10 @@
+
 from diffsynth import ModelManager, SD3ImagePipeline
 from diffsynth.trainers.text_to_image import LightningModelForT2ILoRA, add_general_parsers, launch_training_task
 import torch, os, argparse
 from einops import rearrange
+from lightning.pytorch.utilities import grad_norm
+
 
 os.environ["TOKENIZERS_PARALLELISM"] = "True"
 
@@ -22,25 +25,23 @@ def lets_dance_sd3(
     #prompt_emb = dit.context_embedder(prompt_emb)
 
     height, width = hidden_states.shape[-2:]
+    #print(hidden_states)
+    attention_mask=None
     hidden_states = dit.pos_embedder(hidden_states)
-
-    #print("################",hidden_states.shape,entity_prompt_emb.shape,entity_masks.shape,prompt_emb.shape)
-    if entity_prompt_emb is not None and entity_masks is not None:
+    if  entity_prompt_emb is not None and entity_masks is not None:
         prompt_emb, image_rotary_emb, attention_mask = dit.process_entity_masks(hidden_states, prompt_emb, entity_prompt_emb, entity_masks, text_ids)
     else:
         prompt_emb = dit.context_embedder(prompt_emb)
         image_rotary_emb = None#dit.pos_embedder(torch.cat((text_ids), dim=1))
         attention_mask = None
-
-    #print(attention_mask.shape,hidden_states.shape,prompt_emb.shape,conditioning.shape)
+   #print(hidden_states)
     def create_custom_forward(module):
         def custom_forward(*inputs):
             return module(*inputs)
         return custom_forward
     
     for block in dit.blocks:
-        #print("1",block)
-       hidden_states, prompt_emb = block(hidden_states, prompt_emb, conditioning,mask = attention_mask)
+        hidden_states, prompt_emb = block(hidden_states, prompt_emb, conditioning,attention_mask)
     
     hidden_states = dit.norm_out(hidden_states, conditioning)
     hidden_states = dit.proj_out(hidden_states)
@@ -81,6 +82,17 @@ class LightningModel(LightningModelForT2ILoRA):
         self.total_loss =0
         self.step = 0
     
+    
+    def on_after_backward(self):
+        total_norm = 0.0
+        for p in self.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        total_norm = total_norm ** 0.5
+
+        # Log it to Lightning's logger (e.g., TensorBoard)
+        self.log("train/grad_l2_norm", total_norm, on_step=True, on_epoch=False, prog_bar=True, logger=True)
     def training_step(self, batch, batch_idx):
         # Data
         self.step +=1
@@ -123,7 +135,7 @@ class LightningModel(LightningModelForT2ILoRA):
         
         noise_pred = lets_dance_sd3(
                     dit=self.pipe.denoising_model(),
-                    hidden_states=latents, timestep=timestep,
+                    hidden_states=noisy_latents, timestep=timestep,
                     **prompt_emb,**extra_input, **eligen_kwargs_posi,
                 )#self.pipe.denoising_model()(
             #noisy_latents, timestep=timestep, **prompt_emb, **extra_input,
@@ -138,6 +150,95 @@ class LightningModel(LightningModelForT2ILoRA):
             self.step = 0
             self.total_loss = 0
         return loss
+    
+    
+
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Simple example of a training script.")
+    parser.add_argument(
+        "--pretrained_path",
+        type=str,
+        default=None,
+        required=True,
+        help="Path to pretrained models, separated by comma. For example, SD3: `models/stable_diffusion_3/sd3_medium_incl_clips_t5xxlfp16.safetensors`, SD3.5-large: `models/stable_diffusion_3/text_encoders/clip_g.safetensors,models/stable_diffusion_3/text_encoders/clip_l.safetensors,models/stable_diffusion_3/text_encoders/t5xxl_fp16.safetensors,models/stable_diffusion_3/sd3.5_large.safetensors`",
+    )
+    parser.add_argument(
+        "--lora_target_modules",
+        type=str,
+        default="a_to_qkv,b_to_qkv,norm_1_a.linear,norm_1_b.linear,a_to_out,b_to_out,ff_a.0,ff_a.2,ff_b.0,ff_b.2",
+        help="Layers with LoRA modules.",
+    )
+    parser.add_argument(
+        "--preset_lora_path",
+        type=str,
+        default=None,
+        help="Preset LoRA path.",
+    )
+    parser.add_argument(
+        "--num_timesteps",
+        type=int,
+        default=1000,
+        help="Number of total timesteps. For turbo models, please set this parameter to the number of expected number of inference steps.",
+    )
+    parser = add_general_parsers(parser)
+    args = parser.parse_args()
+    return args
+
+
+if __name__ == '__main__':
+    args = parse_args()
+    model = LightningModel(
+        torch_dtype=torch.float32 if args.precision == "32" else torch.float16,
+        pretrained_weights=args.pretrained_path.split(","),
+        preset_lora_path=args.preset_lora_path,
+        learning_rate=args.learning_rate,
+        use_gradient_checkpointing=args.use_gradient_checkpointing,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        init_lora_weights=args.init_lora_weights,
+        pretrained_lora_path=args.pretrained_lora_path,
+        lora_target_modules=args.lora_target_modules,
+        
+    )
+    launch_training_task(model, args)
+"""
+
+from diffsynth import ModelManager, SD3ImagePipeline
+from diffsynth.trainers.text_to_image import LightningModelForT2ILoRA, add_general_parsers, launch_training_task
+import torch, os, argparse
+os.environ["TOKENIZERS_PARALLELISM"] = "True"
+
+
+class LightningModel(LightningModelForT2ILoRA):
+    def __init__(
+        self,
+        torch_dtype=torch.float16, pretrained_weights=[], preset_lora_path=None,
+        learning_rate=1e-4, use_gradient_checkpointing=True,
+        lora_rank=4, lora_alpha=4, lora_target_modules="to_q,to_k,to_v,to_out", init_lora_weights="gaussian", pretrained_lora_path=None,
+    ):
+        super().__init__(learning_rate=learning_rate, use_gradient_checkpointing=use_gradient_checkpointing)
+        # Load models
+        model_manager = ModelManager(torch_dtype=torch_dtype, device=self.device)
+        model_manager.load_models(pretrained_weights)
+        self.pipe = SD3ImagePipeline.from_model_manager(model_manager)
+        self.pipe.scheduler.set_timesteps(1000, training=True)
+
+        if preset_lora_path is not None:
+            preset_lora_path = preset_lora_path.split(",")
+            for path in preset_lora_path:
+                model_manager.load_lora(path)
+
+        self.freeze_parameters()
+        self.add_lora_to_model(
+            self.pipe.denoising_model(),
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_target_modules=lora_target_modules,
+            init_lora_weights=init_lora_weights,
+            pretrained_lora_path=pretrained_lora_path,
+        )
 
 
 def parse_args():
@@ -187,3 +288,4 @@ if __name__ == '__main__':
         lora_target_modules=args.lora_target_modules
     )
     launch_training_task(model, args)
+    """

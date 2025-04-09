@@ -322,6 +322,8 @@ class FluxImagePipeline(BasePipeline):
 
 
     def prepare_eligen(self, prompt_emb_nega, eligen_entity_prompts, eligen_entity_masks, width, height, t5_sequence_length, enable_eligen_inpaint, enable_eligen_on_negative, cfg_scale):
+        print("$$$$$$$$$$$$$$$$$$$$$$$$$$$",enable_eligen_on_negative)
+
         if eligen_entity_masks is not None:
             entity_prompt_emb_posi, entity_masks_posi, fg_mask, bg_mask = self.prepare_entity_inputs(eligen_entity_prompts, eligen_entity_masks, width, height, t5_sequence_length, enable_eligen_inpaint)
             if enable_eligen_on_negative and cfg_scale != 1.0:
@@ -411,7 +413,6 @@ class FluxImagePipeline(BasePipeline):
 
         # Entity control
         eligen_kwargs_posi, eligen_kwargs_nega, fg_mask, bg_mask = self.prepare_eligen(prompt_emb_nega, eligen_entity_prompts, eligen_entity_masks, width, height, t5_sequence_length, enable_eligen_inpaint, enable_eligen_on_negative, cfg_scale)
-
         # IP-Adapter
         ipadapter_kwargs_list_posi, ipadapter_kwargs_list_nega = self.prepare_ipadapter(ipadapter_images, ipadapter_scale)
 
@@ -592,6 +593,14 @@ def lets_dance_flux(
 
     if entity_prompt_emb is not None and entity_masks is not None:
         prompt_emb, image_rotary_emb, attention_mask = dit.process_entity_masks(hidden_states, prompt_emb, entity_prompt_emb, entity_masks, text_ids, image_ids)
+        binary_mask = torch.where(attention_mask.squeeze(0).squeeze(0) == 0, 1, 0).cpu().numpy().astype(np.uint8) * 255
+    
+        # Convert to image
+        img = Image.fromarray(binary_mask)
+    
+        # Save as PNG image
+        img.save("attn.png")
+
     else:
         prompt_emb = dit.context_embedder(prompt_emb)
         image_rotary_emb = dit.pos_embedder(torch.cat((text_ids, image_ids), dim=1))

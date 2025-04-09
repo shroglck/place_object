@@ -451,4 +451,3 @@ class ModelManager:
     def to(self, device):
         for model in self.model:
             model.to(device)
-

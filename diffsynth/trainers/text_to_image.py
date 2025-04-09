@@ -115,6 +115,14 @@ class LightningModelForT2ILoRA(pl.LightningModule):
         checkpoint.update(lora_state_dict)
 
 
+class GradientLoggingCallback(pl.Callback):
+    def on_after_backward(self, trainer, pl_module):
+        for name, param in pl_module.named_parameters():
+            if param.grad is not None:
+                norm = param.grad.norm(2).item()
+                trainer.logger.experiment.add_scalar(f"grad_norm/{name}", norm, trainer.global_step)
+
+trainer = pl.Trainer(callbacks=[GradientLoggingCallback()])
 
 def add_general_parsers(parser):
     parser.add_argument(
@@ -303,8 +311,10 @@ def launch_training_task(model, args):
         strategy=args.training_strategy,
         default_root_dir=args.output_path,
         accumulate_grad_batches=args.accumulate_grad_batches,
+        log_every_n_steps=1,
         callbacks=[pl.pytorch.callbacks.ModelCheckpoint(save_top_k=-1)],
         logger=logger,
+        #gradient_clip_val=1, gradient_clip_algorithm="value"
     )
     trainer.fit(model=model, train_dataloaders=train_loader)
 

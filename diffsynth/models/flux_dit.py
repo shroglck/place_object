@@ -342,11 +342,13 @@ class FluxDiT(torch.nn.Module):
 
 
     def construct_mask(self, entity_masks, prompt_seq_len, image_seq_len):
-        #print(prompt_seq_len,image_seq_len)
         N = len(entity_masks)
+        print(N,prompt_seq_len,image_seq_len)
+        
         batch_size = entity_masks[0].shape[0]
         total_seq_len = N * prompt_seq_len + image_seq_len
         patched_masks = [self.patchify(entity_masks[i]) for i in range(N)]
+        print(patched_masks[0].shape,"####################")
         attention_mask = torch.ones((batch_size, total_seq_len, total_seq_len), dtype=torch.bool).to(device=entity_masks[0].device)
 
         image_start = N * prompt_seq_len
