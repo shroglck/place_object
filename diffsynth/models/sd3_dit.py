@@ -1,10 +1,118 @@
 import torch
 import numpy as np
+import torch.nn as nn
+
 from PIL import Image
 from einops import rearrange
 from .svd_unet import TemporalTimesteps
 from .tiler import TileWorker
+import math
 
+
+
+
+import torch
+import torch.nn as nn
+import numpy as np
+
+
+class FourierBBoxEmbedding(nn.Module):
+    """
+    Maps bounding box coordinates to Fourier embeddings, then projects to higher dimension.
+    
+    Input shape: [B, N, 4] where:
+        B: batch size
+        N: number of objects
+        4: bbox coordinates (usually x1, y1, x2, y2 or x, y, w, h)
+    
+    Output shape: [B, N, 1536] where 1536 is the final embedding dimension
+    """
+    def __init__(self, input_dim=4, fourier_dim=8, output_dim=1536):
+        super().__init__()
+        assert fourier_dim % (2 * input_dim) == 0, "Fourier dimension must be divisible by 2 * input_dim"
+        
+        self.input_dim = input_dim
+        self.fourier_dim = fourier_dim
+        self.output_dim = output_dim
+        self.freq_bands = fourier_dim // (2 * input_dim)
+        
+        # Generate frequency bands for the embedding
+        # Using exponential distribution for the frequencies
+        self.register_buffer(
+            "frequencies", 
+            2.0 ** torch.linspace(0, self.freq_bands - 1, self.freq_bands)
+        )
+        
+        # Linear projection from fourier_dim to output_dim
+        self.projection = nn.Linear(fourier_dim, output_dim)
+        
+        # Initialize the projection with normal distribution
+        nn.init.normal_(self.projection.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.projection.bias)
+        
+    def _get_fourier_embedding(self, bbox):
+        """
+        Transform bbox coordinates to Fourier embeddings
+        
+        Args:
+            bbox: Tensor of shape [B, N, 4] with bbox coordinates
+        Returns:
+            Tensor of shape [B, N, fourier_dim] with Fourier embeddings
+        """
+        # Get original shape for reshaping at the end
+        B, N, _ = bbox.shape
+        
+        # Reshape to [B*N, 4] for easier processing
+        flat_bbox = bbox.reshape(-1, self.input_dim)
+        
+        # Initialize output tensor
+        embeddings = torch.zeros(flat_bbox.shape[0], self.fourier_dim, device=bbox.device)
+        
+        # For each coordinate in the bounding box
+        for dim in range(self.input_dim):
+            # Get the coordinate values
+            coords = flat_bbox[:, dim]
+            
+            # For each frequency band
+            for band_idx in range(self.freq_bands):
+                # Calculate the frequency
+                freq = self.frequencies[band_idx]
+                
+                # Calculate indices for sin and cos values
+                sin_idx = dim * 2 * self.freq_bands + band_idx
+                cos_idx = dim * 2 * self.freq_bands + band_idx + self.freq_bands
+                
+                # Apply sinusoidal encoding
+                embeddings[:, sin_idx] = torch.sin(coords * freq)
+                embeddings[:, cos_idx] = torch.cos(coords * freq)
+        
+        # Reshape back to original batch dimensions with fourier embedding dimension
+        embeddings = embeddings.reshape(B, N, self.fourier_dim)
+        
+        return embeddings
+        
+    def forward(self, bbox):
+        """
+        Args:
+            bbox: Tensor of shape [B, N, 4] with bbox coordinates
+        Returns:
+            Tensor of shape [B, N, output_dim] with final embeddings
+        """
+        # Get Fourier embeddings
+        fourier_embeddings = self._get_fourier_embedding(bbox)
+        
+        # Project to higher dimension
+        # Reshape for batch processing through linear layer
+        B, N, D = fourier_embeddings.shape
+        flat_embeddings = fourier_embeddings.reshape(-1, D)
+        
+        # Apply projection
+        projected_embeddings = self.projection(flat_embeddings)
+        
+        # Reshape back to batch format
+        output_embeddings = projected_embeddings.reshape(B, N, self.output_dim)
+        
+        return output_embeddings
 
 
 class RMSNorm(torch.nn.Module):
@@ -267,7 +375,7 @@ class JointTransformerBlock(torch.nn.Module):
         )
 
 
-    def forward(self, hidden_states_a, hidden_states_b, temb,mask = None):
+    def forward(self, hidden_states_a, hidden_states_b, temb,mask = None,bbox_embeddings = None):
         #print(hidden_states_a.shape,hidden_states_b.shape,mask.shape)
         if self.norm1_a.dual:
             norm_hidden_states_a, gate_msa_a, shift_mlp_a, scale_mlp_a, gate_mlp_a, norm_hidden_states_a_2, gate_msa_a_2 = self.norm1_a(hidden_states_a, emb=temb)
@@ -329,6 +437,7 @@ class JointTransformerFinalBlock(torch.nn.Module):
 class SD3DiT(torch.nn.Module):
     def __init__(self, embed_dim=1536, num_layers=24, use_rms_norm=False, num_dual_blocks=0, pos_embed_max_size=192):
         super().__init__()
+        self.bbox_embedder = FourierBBoxEmbedding(input_dim=4, fourier_dim=8, output_dim=embed_dim)
         self.pos_embedder = PatchEmbed(patch_size=2, in_channels=16, embed_dim=embed_dim, pos_embed_max_size=pos_embed_max_size)
         self.time_embedder = TimestepEmbeddings(256, embed_dim)
         self.pooled_text_embedder = torch.nn.Sequential(torch.nn.Linear(2048, embed_dim), torch.nn.SiLU(), torch.nn.Linear(embed_dim, embed_dim))
@@ -338,7 +447,7 @@ class SD3DiT(torch.nn.Module):
                                           + [JointTransformerFinalBlock(embed_dim, embed_dim//64, use_rms_norm=use_rms_norm)])
         self.norm_out = AdaLayerNorm(embed_dim, single=True)
         self.proj_out = torch.nn.Linear(embed_dim, 64)
-
+        self.proj_out_bbox = torch.nn.Linear(embed_dim, 4)
     def tiled_forward(self, hidden_states, timestep, prompt_emb, pooled_prompt_emb, tile_size=128, tile_stride=64):
         # Due to the global positional embedding, we cannot implement layer-wise tiled forward.
         hidden_states = TileWorker().tiled_forward(
@@ -352,12 +461,12 @@ class SD3DiT(torch.nn.Module):
         return hidden_states
 
         
-    def _construct_mask(self, entity_masks, prompt_seq_len, image_seq_len):
+    def _construct_mask(self, entity_masks, prompt_seq_len, image_seq_len,bbox_seq_len):
         
         N = len(entity_masks)
         #print(prompt_seq_len,image_seq_len)
         batch_size = entity_masks[0].shape[0]
-        total_seq_len = N * prompt_seq_len + image_seq_len
+        total_seq_len = N * prompt_seq_len + image_seq_len+ bbox_seq_len
         patched_masks = [self.patchify(entity_masks[i]) for i in range(N)]
         attention_mask = torch.ones((batch_size, total_seq_len, total_seq_len), dtype=torch.bool).to(device=entity_masks[0].device)
 
@@ -374,8 +483,8 @@ class SD3DiT(torch.nn.Module):
             # image update with prompt
             attention_mask[:, image_start:image_end, prompt_start:prompt_end] = image_mask.transpose(1, 2)
         # prompt-prompt mask
-        for i in range(N):
-            for j in range(N):
+        for i in range(N-1):
+            for j in range(N-1):
                 if i != j:
                     prompt_start_i = i * prompt_seq_len
                     prompt_end_i = (i + 1) * prompt_seq_len
@@ -387,6 +496,90 @@ class SD3DiT(torch.nn.Module):
         attention_mask = attention_mask.float()
         attention_mask[attention_mask == 0] = float('-inf')
         attention_mask[attention_mask == 1] = 0
+        return attention_mask
+    def _construct_mask_bbox(self, entity_masks, prompt_seq_len, bbox_seq_len, image_seq_len):
+        N = len(entity_masks)
+        batch_size = entity_masks[0].shape[0]
+        
+        # Calculate total sequence length with bboxes in between prompts and images
+        total_seq_len = N * prompt_seq_len + bbox_seq_len + N-1
+        
+        # Patchify entity masks
+        patched_masks = [self.patchify(entity_masks[i]) for i in range(N)]
+        
+        # Initialize attention mask (all ones initially meaning all positions attend to each other)
+        attention_mask = torch.ones(( batch_size,total_seq_len, total_seq_len), dtype=torch.bool).to(device=entity_masks[0].device)
+        
+        # Define section boundaries
+        single_bbox_len = 1
+        prompts_end = N * prompt_seq_len
+        bbox_start = prompts_end
+        bbox_end = bbox_start + (N-1)*single_bbox_len
+        image_start = bbox_end
+        image_end = total_seq_len
+        
+        # Calculate individual bbox length (assuming equal division)
+        #bbox_seq_len // N
+        
+        # Handle prompt-to-prompt attention (prevent cross-prompt attention)
+        for i in range(N-1):
+            for j in range(N-1):
+                if i != j:
+                    prompt_start_i = i * prompt_seq_len
+                    prompt_end_i = (i + 1) * prompt_seq_len
+                    prompt_start_j = j * prompt_seq_len
+                    prompt_end_j = (j + 1) * prompt_seq_len
+                    attention_mask[:, prompt_start_i:prompt_end_i, prompt_start_j:prompt_end_j] = False
+        
+        # Handle bbox attention patterns
+        for i in range(N):
+            prompt_start_i = i * prompt_seq_len
+            prompt_end_i = (i + 1) * prompt_seq_len
+            bbox_start_i = bbox_start + i * single_bbox_len
+            bbox_end_i = bbox_start + (i + 1) * single_bbox_len
+            
+            # Create image mask for this entity
+            image_mask = torch.sum(patched_masks[i], dim=-1) > 0
+            
+            # 1. Set bbox[i] attends to its prompt[i] and vice versa
+            attention_mask[:, bbox_start_i:bbox_end_i, prompt_start_i:prompt_end_i] = True
+            attention_mask[:, prompt_start_i:prompt_end_i, bbox_start_i:bbox_end_i] = True
+            
+            # 2. Set bbox[i] attends to its image regions (based on mask[i])
+            # Expand image mask to match bbox sequence length
+            image_mask = torch.sum(patched_masks[i], dim=-1) > 0
+            image_mask_prompt = image_mask.unsqueeze(1).repeat(1, prompt_seq_len, 1)
+            # prompt update with image
+            attention_mask[:, prompt_start_i:prompt_end_i, image_start:image_end] = image_mask_prompt
+            # image update with prompt
+            attention_mask[:, image_start:image_end, prompt_start_i:prompt_end_i] = image_mask_prompt.transpose(1, 2)
+            bbox_image_mask = image_mask.unsqueeze(1).repeat(1, single_bbox_len, 1)
+            #print(image_mask.shape,bbox_image_mask.shape)
+            attention_mask[:, bbox_start_i:bbox_end_i, image_start:image_end] = bbox_image_mask
+            attention_mask[:, image_start:image_end, bbox_start_i:bbox_end_i] = bbox_image_mask.transpose(1, 2)
+            
+            # 3. Set bbox[i] doesn't attend to other prompts
+            for j in range(N):
+                if i != j:
+                    prompt_start_j = j * prompt_seq_len
+                    prompt_end_j = (j + 1) * prompt_seq_len
+                    attention_mask[:, bbox_start_i:bbox_end_i, prompt_start_j:prompt_end_j] = False
+                    attention_mask[:, prompt_start_j:prompt_end_j, bbox_start_i:bbox_end_i] = False
+            
+            # 4. Set bbox[i] doesn't attend to other bboxes
+            for j in range(N):
+                if i != j:
+                    bbox_start_j = bbox_start + j * single_bbox_len
+                    bbox_end_j = bbox_start + (j + 1) * single_bbox_len
+                    attention_mask[:, bbox_start_i:bbox_end_i, bbox_start_j:bbox_end_j] = False
+        
+        
+        
+        # Convert to float attention mask (standard format for transformers)
+        attention_mask = attention_mask.float()
+        attention_mask[attention_mask == 0] = float('-inf')
+        attention_mask[attention_mask == 1] = 0
+        
         return attention_mask
     
     def construct_mask(self, entity_masks, prompt_seq_len, image_seq_len):
@@ -428,7 +621,7 @@ class SD3DiT(torch.nn.Module):
         attention_mask[attention_mask == 1] = 0
         return attention_mask
     
-    def process_entity_masks(self, hidden_states, prompt_emb, entity_prompt_emb, entity_masks, text_ids):
+    def process_entity_masks(self, hidden_states, prompt_emb, entity_prompt_emb, entity_masks, text_ids,bbox_embeddings = None):
         repeat_dim = hidden_states.shape[1]
         max_masks = 0
         attention_mask = None
@@ -438,9 +631,6 @@ class SD3DiT(torch.nn.Module):
         if entity_masks is not None:
             # entity_masks
             batch_size, max_masks = entity_masks.shape[0], entity_masks.shape[1]
-            #max_masks = 10//////////////
-            #print(entity_masks[0].shape,prompt_emb.shape,entity_prompt_emb.shape,entity_masks[0].sum()*3)
-            Image.fromarray(entity_masks[0][0][0].to(dtype = torch.float16).cpu().numpy().astype(np.uint8) * 255).save("mask.png")
             
             entity_masks = entity_masks.repeat(1, 1, repeat_dim, 1, 1)
             entity_masks = [entity_masks[:, i, None].squeeze(1) for i in range(max_masks)]
@@ -448,7 +638,12 @@ class SD3DiT(torch.nn.Module):
             global_mask = torch.ones_like(entity_masks[0]).to(device=hidden_states.device, dtype=hidden_states.dtype)
             entity_masks = entity_masks + [global_mask] # append global to last
             # attention mask
-            attention_mask = self._construct_mask(entity_masks, prompt_emb.shape[1], hidden_states.shape[1])
+            if bbox_embeddings is not None:
+                #bbox_embeddings = bbox_embeddings.repeat(1, 1, repeat_dim, 1, 1)
+                #ntity_prompt_emb = torch.cat((entity_prompt_emb, bbox_embeddings), dim=1)
+                attention_mask = self._construct_mask_bbox(entity_masks, prompt_emb.shape[1], hidden_states.shape[1],bbox_embeddings.shape[1])#_construct_mask
+            else:
+                attention_mask = self._construct_mask(entity_masks, prompt_emb.shape[1], hidden_states.shape[1],0)
             attention_mask = attention_mask.to(device=hidden_states.device, dtype=hidden_states.dtype)
             attention_mask = attention_mask.unsqueeze(1)
             # embds: n_masks * b * seq * d

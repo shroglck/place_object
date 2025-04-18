@@ -1,4 +1,4 @@
-
+# -*- coding: utf-8 -*-
 from ..models import ModelManager, SD3TextEncoder1, SD3TextEncoder2, SD3TextEncoder3, SD3DiT, SD3VAEDecoder, SD3VAEEncoder
 from ..prompters import SD3Prompter
 from ..schedulers import FlowMatchScheduler
@@ -254,7 +254,7 @@ def lets_dance_sd3(
     
     conditioning = dit.time_embedder(timestep, hidden_states.dtype) + dit.pooled_text_embedder(pooled_prompt_emb)
     #prompt_emb = dit.context_embedder(prompt_emb)
-
+    print(hidden_states.shape)
     height, width = hidden_states.shape[-2:]
     hidden_states = dit.pos_embedder(hidden_states)
     #print(entity_prompt_emb)
@@ -280,11 +280,13 @@ def lets_dance_sd3(
         def custom_forward(*inputs):
             return module(*inputs)
         return custom_forward
-    
+    cnt=0
     for block in dit.blocks:
+        
         #print("1",block)
-       hidden_states, prompt_emb = block(hidden_states, prompt_emb, conditioning,mask=attention_mask)
-    
+        print(hidden_states.shape,prompt_emb.shape,conditioning.shape,"#########",cnt)
+        hidden_states, prompt_emb = block(hidden_states, prompt_emb, conditioning,mask=attention_mask)
+        cnt+=1
     hidden_states = dit.norm_out(hidden_states, conditioning)
     hidden_states = dit.proj_out(hidden_states)
     hidden_states = rearrange(hidden_states, "B (H W) (P Q C) -> B C (H P) (W Q)", P=2, Q=2, H=height//2, W=width//2)
@@ -437,4 +439,4 @@ class SD3ImagePipeline(BasePipeline):
         # offload all models
         self.load_models_to_device([])
         return image
-    """
+"""    

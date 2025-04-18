@@ -314,7 +314,7 @@ def launch_training_task(model, args):
         log_every_n_steps=1,
         callbacks=[pl.pytorch.callbacks.ModelCheckpoint(save_top_k=-1)],
         logger=logger,
-        #gradient_clip_val=1, gradient_clip_algorithm="value"
+        gradient_clip_val=1, gradient_clip_algorithm="value"
     )
     trainer.fit(model=model, train_dataloaders=train_loader)
 
