@@ -3,6 +3,7 @@ import numpy as np
 from diffsynth import ModelManager, SD3ImagePipeline
 from diffsynth.trainers.text_to_image import LightningModelForT2ILoRA, add_general_parsers, launch_training_task
 import torch, os, argparse
+import torch.nn as nn
 from einops import rearrange
 from lightning.pytorch.utilities import grad_norm
 
@@ -53,12 +54,12 @@ def lets_dance_sd3(
         return custom_forward
     bbox_embeddings = bbox_embeddings
     num_bbox = bbox_embeddings.shape[1]
-    hidden_states = torch.cat([hidden_states, bbox_embeddings], dim=1)
+    hidden_states = torch.cat([bbox_embeddings,hidden_states], dim=1)
     for block in dit.blocks:
         hidden_states, prompt_emb = block(hidden_states, prompt_emb, conditioning,attention_mask)
     
     hidden_states = dit.norm_out(hidden_states, conditioning)
-    hidden_states,bbox_states =  hidden_states[:,:-num_bbox,:], hidden_states[:,-num_bbox:,:]
+    bbox_states,hidden_states =  hidden_states[:,:num_bbox,:], hidden_states[:,num_bbox:,:]
     hidden_states = dit.proj_out(hidden_states)
     bbox_out= dit.proj_out_bbox(bbox_states)
 
@@ -88,6 +89,12 @@ class LightningModel(LightningModelForT2ILoRA):
             for path in preset_lora_path:
                 model_manager.load_lora(path)
 
+        nn.init.xavier_uniform_(self.pipe.denoising_model().bbox_embedder.projection.weight)
+        nn.init.zeros_(self.pipe.denoising_model().bbox_embedder.projection.bias)
+
+        nn.init.xavier_uniform_(self.pipe.denoising_model().proj_out_bbox.weight)
+        nn.init.zeros_(self.pipe.denoising_model().proj_out_bbox.bias)
+
         self.freeze_parameters()
         self.add_lora_to_model(
             self.pipe.denoising_model(),
@@ -97,11 +104,12 @@ class LightningModel(LightningModelForT2ILoRA):
             init_lora_weights=init_lora_weights,
             pretrained_lora_path=pretrained_lora_path,
         )
+        
         self.total_loss =0
         self.step = 0
     
     
-    def on_after_backward(self):
+    """def on_after_backward(self):
         total_norm = 0.0
         for p in self.parameters():
             if p.grad is not None:
@@ -111,12 +119,13 @@ class LightningModel(LightningModelForT2ILoRA):
 
         # Log it to Lightning's logger (e.g., TensorBoard)
         self.log("train/grad_l2_norm", total_norm, on_step=True, on_epoch=False, prog_bar=True, logger=True)
+    """
     def training_step(self, batch, batch_idx):
         # Data
         self.step +=1
         text, image = batch["text"], batch["image"]
         entity_masks = batch["entity_mask"]
-        bbox = torch.stack(batch['bboxes']).permute(1,0,2)
+        bbox = 2*(torch.stack(batch['bboxes']).permute(1,0,2)-0.5)
         #bboxes = batch['bboxes']
         #entity_prompts =[iii[0] for iii in batch["entity_prompt"] if iii[0] != '']
         entity_prompts = []

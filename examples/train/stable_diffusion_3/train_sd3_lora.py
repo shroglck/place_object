@@ -64,13 +64,14 @@ class LightningModel(LightningModelForT2ILoRA):
         model_manager.load_models(pretrained_weights)
         self.pipe = SD3ImagePipeline.from_model_manager(model_manager)
         self.pipe.scheduler.set_timesteps(1000, training=True)
-
+        
         if preset_lora_path is not None:
             preset_lora_path = preset_lora_path.split(",")
             for path in preset_lora_path:
                 model_manager.load_lora(path)
 
         self.freeze_parameters()
+        
         self.add_lora_to_model(
             self.pipe.denoising_model(),
             lora_rank=lora_rank,
@@ -79,7 +80,9 @@ class LightningModel(LightningModelForT2ILoRA):
             init_lora_weights=init_lora_weights,
             pretrained_lora_path=pretrained_lora_path,
         )
+        
         self.total_loss =0
+        
         self.step = 0
     
     

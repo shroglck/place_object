@@ -47,11 +47,23 @@ class LightningModelForT2ILoRA(pl.LightningModule):
             target_modules=lora_target_modules.split(","),
         )
         model = inject_adapter_in_model(lora_config, model)
-        for param in model.parameters():
-            # Upcast LoRA parameters into fp32
-            if param.requires_grad:
-                param.data = param.to(torch.float32)
+        #print(model)
+        try:
+            for param in model.bbox_embedder.parameters():
+                param.requires_grad = True
 
+            for param in model.proj_out_bbox.parameters():
+                param.requires_grad = True
+
+            for param in model.parameters():
+                # Upcast LoRA parameters into fp32
+                if param.requires_grad:
+                    #print(param)
+                    param.data = param.to(torch.float32)
+            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            print(f"Total trainable parameters: {trainable_params}")
+        except Exception as e:
+            print()
         # Lora pretrained lora weights
         if pretrained_lora_path is not None:
             state_dict = load_state_dict(pretrained_lora_path)
@@ -97,6 +109,7 @@ class LightningModelForT2ILoRA(pl.LightningModule):
 
     def configure_optimizers(self):
         trainable_modules = filter(lambda p: p.requires_grad, self.pipe.denoising_model().parameters())
+        
         optimizer = torch.optim.AdamW(trainable_modules, lr=self.learning_rate)
         return optimizer
     
@@ -314,7 +327,7 @@ def launch_training_task(model, args):
         log_every_n_steps=1,
         callbacks=[pl.pytorch.callbacks.ModelCheckpoint(save_top_k=-1)],
         logger=logger,
-        gradient_clip_val=1, gradient_clip_algorithm="value"
+        #gradient_clip_val=1, gradient_clip_algorithm="value"
     )
     trainer.fit(model=model, train_dataloaders=train_loader)
 

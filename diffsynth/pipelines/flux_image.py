@@ -8,6 +8,8 @@ import torch
 from tqdm import tqdm
 import numpy as np
 from PIL import Image
+import torch.nn.functional as F
+
 from ..models.tiler import FastTileWorker
 from transformers import SiglipVisionModel
 from copy import deepcopy
@@ -136,7 +138,42 @@ class FluxImagePipeline(BasePipeline):
     def denoising_model(self):
         return self.dit
 
-
+    def load_specific_layers(self, target_layers=["final_bbox_out", "bbox_embedder"]):
+        """
+        Load weights only for specific layers from a weights dictionary.
+        
+        Args:
+            model: The model to load weights into
+            weights_dict: Dictionary containing weights
+            target_layers: List of layer names to load weights for
+        
+        Returns:
+            model: The model with updated weights
+            loaded_keys: List of parameter keys that were loaded
+        """
+        weights_dict = torch.load("/data/shresth/DiffSynth-Studio/lightning_logs/version_69/checkpoints/epoch=17-step=13500.ckpt")
+        loaded_keys = []
+        model_state_dict = self.dit.state_dict()
+        
+        # Filter weights dictionary to only include keys for target layers
+        for key in model_state_dict.keys():
+            # Check if the key belongs to any of the target layers
+            if any(target_layer in key for target_layer in target_layers):
+                if key in weights_dict:
+                    # Get the target parameter
+                    param = model_state_dict[key]
+                    # Get the weight from the dictionary
+                    weight = weights_dict[key]
+                    
+                    # Match device and dtype before loading
+                    weight = weight.to(device=param.device, dtype=param.dtype)
+                    
+                    # Update the model's state dict
+                    model_state_dict[key] = weight
+                    loaded_keys.append(key)
+        # Load the filtered state dict back into the model
+        self.dit.load_state_dict(model_state_dict, strict=False)
+    
     def fetch_models(self, model_manager: ModelManager, controlnet_config_units: List[ControlNetConfigUnit]=[], prompt_refiner_classes=[], prompt_extender_classes=[]):
         self.text_encoder_1 = model_manager.fetch_model("sd3_text_encoder_1")
         self.text_encoder_2 = model_manager.fetch_model("flux_text_encoder_2")
@@ -261,6 +298,12 @@ class FluxImagePipeline(BasePipeline):
         out_masks = []
         for mask in masks:
             mask = self.preprocess_image(mask.resize((width, height), resample=Image.NEAREST)).mean(dim=1, keepdim=True) > 0
+            #mask = F.interpolate(mask.unsqueeze(0), size=(height, width,3), mode='nearest').squeeze(0).squeeze(0)
+            #d = mask.device
+            #mask = np.array(mask.cpu())
+            
+            #mask = self.preprocess_image(mask).mean(dim=1, keepdim=True) > 0
+        
             mask = mask.repeat(1, dim, 1, 1).to(device=self.device, dtype=self.torch_dtype)
             out_masks.append(mask)
         return out_masks
@@ -280,17 +323,21 @@ class FluxImagePipeline(BasePipeline):
         return entity_prompts, entity_masks, fg_mask, bg_mask
 
 
-    def prepare_latents(self, input_image, height, width, seed, tiled, tile_size, tile_stride):
+    def prepare_latents(self, input_image, height, width, seed,tiled, tile_size, tile_stride,bbox= None):
         if input_image is not None:
             self.load_models_to_device(['vae_encoder'])
             image = self.preprocess_image(input_image).to(device=self.device, dtype=self.torch_dtype)
             input_latents = self.encode_image(image, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
             noise = self.generate_noise((1, 16, height//8, width//8), seed=seed, device=self.device, dtype=self.torch_dtype)
             latents = self.scheduler.add_noise(input_latents, noise, timestep=self.scheduler.timesteps[0])
+            noise_bbox = self.generate_noise((1,bbox.shape[1],4), seed=seed, device=self.device, dtype=self.torch_dtype)
+            bbox_latents = self.scheduler.add_noise(bbox, noise_bbox, timestep=self.scheduler.timesteps[0])
         else:
             latents = self.generate_noise((1, 16, height//8, width//8), seed=seed, device=self.device, dtype=self.torch_dtype)
+            noise_bbox = self.generate_noise((1,bbox.shape[1],4), seed=seed, device=self.device, dtype=self.torch_dtype)
+            bbox_latents = self.scheduler.add_noise(bbox, noise_bbox, timestep=self.scheduler.timesteps[0])
             input_latents = None
-        return latents, input_latents
+        return latents, input_latents,bbox_latents
 
 
     def prepare_ipadapter(self, ipadapter_images, ipadapter_scale):
@@ -322,7 +369,7 @@ class FluxImagePipeline(BasePipeline):
 
 
     def prepare_eligen(self, prompt_emb_nega, eligen_entity_prompts, eligen_entity_masks, width, height, t5_sequence_length, enable_eligen_inpaint, enable_eligen_on_negative, cfg_scale):
-        print("$$$$$$$$$$$$$$$$$$$$$$$$$$$",enable_eligen_on_negative)
+        #print("$$$$$$$$$$$$$$$$$$$$$$$$$$$",enable_eligen_on_negative)
 
         if eligen_entity_masks is not None:
             entity_prompt_emb_posi, entity_masks_posi, fg_mask, bg_mask = self.prepare_entity_inputs(eligen_entity_prompts, eligen_entity_masks, width, height, t5_sequence_length, enable_eligen_inpaint)
@@ -384,6 +431,7 @@ class FluxImagePipeline(BasePipeline):
         eligen_entity_masks=None,
         enable_eligen_on_negative=False,
         enable_eligen_inpaint=False,
+        bbox = None,
         # TeaCache
         tea_cache_l1_thresh=None,
         # Tile
@@ -395,6 +443,8 @@ class FluxImagePipeline(BasePipeline):
         progress_bar_st=None,
     ):
         height, width = self.check_resize_height_width(height, width)
+        bbox = 2*(torch.stack(bbox).permute(1,0,2)-0.5)
+
 
         # Tiler parameters
         tiler_kwargs = {"tiled": tiled, "tile_size": tile_size, "tile_stride": tile_stride}
@@ -403,7 +453,7 @@ class FluxImagePipeline(BasePipeline):
         self.scheduler.set_timesteps(num_inference_steps, denoising_strength)
 
         # Prepare latent tensors
-        latents, input_latents = self.prepare_latents(input_image, height, width, seed, tiled, tile_size, tile_stride)
+        latents, input_latents,bbox_latents = self.prepare_latents(input_image, height, width, seed, tiled, tile_size, tile_stride,bbox=bbox)
 
         # Prompt
         prompt_emb_posi, prompt_emb_nega, prompt_emb_locals = self.prepare_prompts(prompt, local_prompts, masks, mask_scales, t5_sequence_length, negative_prompt, cfg_scale)
@@ -430,13 +480,18 @@ class FluxImagePipeline(BasePipeline):
             # Positive side
             inference_callback = lambda prompt_emb_posi, controlnet_kwargs: lets_dance_flux(
                 dit=self.dit, controlnet=self.controlnet,
-                hidden_states=latents, timestep=timestep,
+                hidden_states=latents, timestep=timestep,bbox_emb=bbox_latents,
                 **prompt_emb_posi, **tiler_kwargs, **extra_input, **controlnet_kwargs, **ipadapter_kwargs_list_posi, **eligen_kwargs_posi, **tea_cache_kwargs,
             )
-            noise_pred_posi = self.control_noise_via_local_prompts(
-                prompt_emb_posi, prompt_emb_locals, masks, mask_scales, inference_callback,
-                special_kwargs=controlnet_kwargs_posi, special_local_kwargs_list=local_controlnet_kwargs
-            )
+            noise_pred_posi,noise_pred_posi_bbox = lets_dance_flux(dit=self.dit, controlnet=self.controlnet,
+                    hidden_states=latents, timestep=timestep,bbox_emb=bbox_latents,
+                    **prompt_emb_posi, **tiler_kwargs, **extra_input, **controlnet_kwargs_posi, **ipadapter_kwargs_list_posi, **eligen_kwargs_posi,
+                )
+            
+            #self.control_noise_via_local_prompts(
+                #prompt_emb_posi, prompt_emb_locals, masks, mask_scales, inference_callback,
+                #special_kwargs=controlnet_kwargs_posi, special_local_kwargs_list=local_controlnet_kwargs
+            #)
 
             # Inpaint
             if enable_eligen_inpaint:
@@ -445,26 +500,28 @@ class FluxImagePipeline(BasePipeline):
             # Classifier-free guidance
             if cfg_scale != 1.0:
                 # Negative side
-                noise_pred_nega = lets_dance_flux(
+                noise_pred_nega,noise_pred_nega_bbox = lets_dance_flux(
                     dit=self.dit, controlnet=self.controlnet,
-                    hidden_states=latents, timestep=timestep,
+                    hidden_states=latents, timestep=timestep,bbox_emb=bbox_latents,
                     **prompt_emb_nega, **tiler_kwargs, **extra_input, **controlnet_kwargs_nega, **ipadapter_kwargs_list_nega, **eligen_kwargs_nega,
                 )
                 noise_pred = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
+                noise_pred_bbox = noise_pred_nega_bbox + cfg_scale * (noise_pred_posi_bbox - noise_pred_nega_bbox)
             else:
                 noise_pred = noise_pred_posi
 
             # Iterate
             latents = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], latents)
-
+            bbox_latents = self.scheduler.step(noise_pred_bbox, self.scheduler.timesteps[progress_id], bbox_latents)
             # UI
             if progress_bar_st is not None:
                 progress_bar_st.progress(progress_id / len(self.scheduler.timesteps))
         
         # Decode image
+        
         self.load_models_to_device(['vae_decoder'])
         image = self.decode_image(latents, **tiler_kwargs)
-
+        print(bbox_latents/2+0.5)
         # Offload all models
         self.load_models_to_device([])
         return image
@@ -523,6 +580,7 @@ def lets_dance_flux(
     guidance=None,
     text_ids=None,
     image_ids=None,
+    bbox_emb=None, 
     controlnet_frames=None,
     tiled=False,
     tile_size=128,
@@ -533,6 +591,9 @@ def lets_dance_flux(
     tea_cache: TeaCache = None,
     **kwargs
 ):
+    bbox_emb = dit.bbox_embedder(bbox_emb)
+    bbox_ids = torch.zeros((1,bbox_emb.shape[1],3),device=hidden_states.device)
+    
     if tiled:
         def flux_forward_fn(hl, hr, wl, wr):
             tiled_controlnet_frames = [f[:, :, hl: hr, wl: wr] for f in controlnet_frames] if controlnet_frames is not None else None
@@ -577,7 +638,6 @@ def lets_dance_flux(
         controlnet_res_stack, controlnet_single_res_stack = controlnet(
             controlnet_frames, **controlnet_extra_kwargs
         )
-
     if image_ids is None:
         image_ids = dit.prepare_image_ids(hidden_states)
     
@@ -590,9 +650,8 @@ def lets_dance_flux(
     hidden_states = dit.patchify(hidden_states)
     hidden_states = dit.x_embedder(hidden_states)
     #print(hidden_states.shape,prompt_emb.shape,entity_prompt_emb.shape)
-
     if entity_prompt_emb is not None and entity_masks is not None:
-        prompt_emb, image_rotary_emb, attention_mask = dit.process_entity_masks(hidden_states, prompt_emb, entity_prompt_emb, entity_masks, text_ids, image_ids)
+        prompt_emb, image_rotary_emb, attention_mask = dit.process_entity_masks(hidden_states, prompt_emb, entity_prompt_emb, entity_masks, text_ids, image_ids,bbox_ids=bbox_ids)
         binary_mask = torch.where(attention_mask.squeeze(0).squeeze(0) == 0, 1, 0).cpu().numpy().astype(np.uint8) * 255
     
         # Convert to image
@@ -603,8 +662,9 @@ def lets_dance_flux(
 
     else:
         prompt_emb = dit.context_embedder(prompt_emb)
-        image_rotary_emb = dit.pos_embedder(torch.cat((text_ids, image_ids), dim=1))
+        image_rotary_emb = dit.pos_embedder(torch.cat((text_ids, image_ids,bbox_ids), dim=1))
         attention_mask = None
+    hidden_states = torch.cat([hidden_states, bbox_emb], dim=1)
     # TeaCache
     if tea_cache is not None:
         tea_cache_update = tea_cache.check(dit, hidden_states, conditioning)
@@ -624,7 +684,7 @@ def lets_dance_flux(
                 conditioning,
                 image_rotary_emb,
                 attention_mask,
-                ipadapter_kwargs_list=ipadapter_kwargs_list.get(block_id, None)
+                #ipadapter_kwargs_list=ipadapter_kwargs_list.get(block_id, None)
             )
             # Contr
             # olNet
@@ -652,7 +712,11 @@ def lets_dance_flux(
             tea_cache.store(hidden_states)
 
     hidden_states = dit.final_norm_out(hidden_states, conditioning)
-    hidden_states = dit.final_proj_out(hidden_states)
+    hidden_states_image = hidden_states[:, :-bbox_emb.shape[1]]
+    hidden_states_bbox = hidden_states[:, -bbox_emb.shape[1]:]
+    hidden_states = dit.final_proj_out(hidden_states_image)
+    hidden_states_bbox = dit.final_bbox_out(hidden_states_bbox)
+    
     hidden_states = dit.unpatchify(hidden_states, height, width)
 
-    return hidden_states
+    return hidden_states,hidden_states_bbox

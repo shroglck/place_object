@@ -4,7 +4,6 @@ import pandas as pd
 from PIL import Image
 import numpy as np
 import json
-torch.manual_seed(0)
 
 
 class TextImageDataset(torch.utils.data.Dataset):
@@ -82,7 +81,8 @@ class TextImageDataset(torch.utils.data.Dataset):
             masks.append(np.zeros((target_height,target_width,3)))
             entity_prompts.append("")
         
-
+        if len(bboxes) > 10:
+            bboxes = bboxes[:10]
         
         image = torchvision.transforms.functional.resize(image,shape,interpolation=transforms.InterpolationMode.BILINEAR)
         image = self.image_processor(image)

@@ -47,8 +47,7 @@ class FourierBBoxEmbedding(nn.Module):
         self.projection = nn.Linear(fourier_dim, output_dim)
         
         # Initialize the projection with normal distribution
-        nn.init.normal_(self.projection.weight, mean=0.0, std=0.02)
-        nn.init.zeros_(self.projection.bias)
+        
         
     def _get_fourier_embedding(self, bbox):
         """
@@ -105,8 +104,9 @@ class FourierBBoxEmbedding(nn.Module):
         # Reshape for batch processing through linear layer
         B, N, D = fourier_embeddings.shape
         flat_embeddings = fourier_embeddings.reshape(-1, D)
-        
+        flat_embeddings = flat_embeddings.to(torch.float16)
         # Apply projection
+        
         projected_embeddings = self.projection(flat_embeddings)
         
         # Reshape back to batch format
