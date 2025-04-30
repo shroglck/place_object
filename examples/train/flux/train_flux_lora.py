@@ -3,9 +3,47 @@ from diffsynth.trainers.text_to_image import LightningModelForT2ILoRA, add_gener
 from diffsynth.models.lora import FluxLoRAConverter
 import torch, os, argparse
 import torch.nn as nn
+from torch.nn import init
 os.environ["TOKENIZERS_PARALLELISM"] = "True"
 
-
+def set_trainable_parameters(model, pattern="_c", initialize=True):
+    """
+    Sets parameters with a specific pattern in their name to be trainable,
+    while freezing all other parameters. Optionally initializes the trainable parameters.
+    
+    Args:
+        model: PyTorch model
+        pattern: String pattern to match in parameter names
+        initialize: Whether to initialize the trainable parameters
+    """
+    # First freeze all parameters
+    for param in model.parameters():
+        param.requires_grad = False
+    
+    # Counter for stats
+    trainable_count = 0
+    total_count = 0
+    
+    # Then unfreeze and initialize parameters with the pattern in their name
+    for name, param in model.named_parameters():
+        total_count += 1
+        if pattern in name:
+            param.requires_grad = True
+            trainable_count += 1
+            
+            # Initialize the parameter if requested
+            if initialize:
+                if len(param.shape) > 1:
+                    # For weight matrices
+                    init.xavier_normal_(param)
+                else:
+                    # For bias vectors
+                    init.zeros_(param)
+    
+    print(f"Made {trainable_count} out of {total_count} parameters trainable.")
+    print(f"Trainable parameters have '{pattern}' in their name.")
+    
+    return model
 class LightningModel(LightningModelForT2ILoRA):
     def __init__(
         self,
@@ -41,6 +79,7 @@ class LightningModel(LightningModelForT2ILoRA):
 
 
         self.freeze_parameters()
+        set_trainable_parameters(self.pipe.denoising_model(), pattern="_c", initialize=True)
         self.pipe.denoising_model().bbox_embedder.projection.requires_grad = True
         self.pipe.denoising_model().final_bbox_out.requires_grad = True
         self.add_lora_to_model(
@@ -112,7 +151,7 @@ class LightningModel(LightningModelForT2ILoRA):
         loss = loss * self.pipe.scheduler.training_weight(timestep)
         #self.total_loss += loss
         # Record log
-        self.log("train_loss", loss-loss_bbox, prog_bar=True)
+        self.log("train_loss", loss/self.pipe.scheduler.training_weight(timestep)-loss_bbox, prog_bar=True)
         self.log("train_loss_bbox", loss_bbox, prog_bar=True)
         return loss
     
@@ -146,30 +185,33 @@ def lets_dance_flux(
     height, width = hidden_states.shape[-2:]
     hidden_states = dit.patchify(hidden_states)
     hidden_states = dit.x_embedder(hidden_states)
-    bbox_ids = torch.zeros((1,bbox_emb.shape[1],3),device=hidden_states.device)
+    bbox_ids = torch.arange(bbox_emb.shape[1],device=hidden_states.device).unsqueeze(0).unsqueeze(-1).repeat(1,1,3)
     if entity_prompt_emb is not None and entity_masks is not None:
         prompt_emb, image_rotary_emb, attention_mask = dit.process_entity_masks(hidden_states, prompt_emb, entity_prompt_emb, entity_masks, text_ids, image_ids,bbox_ids)
     else:
         prompt_emb = dit.context_embedder(prompt_emb)
         image_rotary_emb = dit.pos_embedder(torch.cat((text_ids, image_ids), dim=1))
         attention_mask = None
-    hidden_states = torch.cat([hidden_states, bbox_emb], dim=1)
+    #hidden_states = torch.cat([hidden_states, bbox_emb], dim=1)
     def create_custom_forward(module):
         def custom_forward(*inputs):
             return module(*inputs)
         return custom_forward
-    #print(hidden_states.shape, prompt_emb.shape, conditioning.shape, image_rotary_emb.shape, attention_mask.shape)
     for block in dit.blocks:
         if dit.training and use_gradient_checkpointing:
-            hidden_states, prompt_emb = torch.utils.checkpoint.checkpoint(
+            hidden_states, prompt_emb,bbox_emb = torch.utils.checkpoint.checkpoint(
                 create_custom_forward(block),
-                hidden_states, prompt_emb, conditioning, image_rotary_emb, attention_mask,
+                hidden_states, prompt_emb,bbox_emb, conditioning, image_rotary_emb, attention_mask,
                 use_reentrant=False,
             )
         else:
             hidden_states, prompt_emb = block(hidden_states, prompt_emb, conditioning, image_rotary_emb, attention_mask)
 
     hidden_states = torch.cat([prompt_emb, hidden_states], dim=1)
+    attention_mask = attention_mask[:,:, :hidden_states.shape[1], :hidden_states.shape[1]]
+    image_rotary_emb = image_rotary_emb[:,:, :hidden_states.shape[1]]
+    
+    
     for block in dit.single_blocks:
         if dit.training and use_gradient_checkpointing:
             hidden_states, prompt_emb = torch.utils.checkpoint.checkpoint(
@@ -182,10 +224,10 @@ def lets_dance_flux(
     hidden_states = hidden_states[:, prompt_emb.shape[1]:]
     
     hidden_states = dit.final_norm_out(hidden_states, conditioning)
-    hidden_states_image = hidden_states[:, :-bbox_emb.shape[1]]
-    hidden_states_bbox = hidden_states[:, -bbox_emb.shape[1]:]
-    hidden_states = dit.final_proj_out(hidden_states_image)
-    hidden_states_bbox = dit.final_bbox_out(hidden_states_bbox)
+    #hidden_states_image = hidden_states[:, :-bbox_emb.shape[1]]
+    #hidden_states_bbox = hidden_states[:, -bbox_emb.shape[1]:]
+    hidden_states = dit.final_proj_out(hidden_states)
+    hidden_states_bbox = dit.final_bbox_out(bbox_emb)
     hidden_states = dit.unpatchify(hidden_states, height, width)
 
     return hidden_states,hidden_states_bbox

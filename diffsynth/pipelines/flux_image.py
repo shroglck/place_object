@@ -151,7 +151,7 @@ class FluxImagePipeline(BasePipeline):
             model: The model with updated weights
             loaded_keys: List of parameter keys that were loaded
         """
-        weights_dict = torch.load("/data/shresth/DiffSynth-Studio/lightning_logs/version_69/checkpoints/epoch=17-step=13500.ckpt")
+        weights_dict = torch.load("/data/shresth/DiffSynth-Studio/lightning_logs/version_69/checkpoints/epoch=26-step=20250.ckpt")
         loaded_keys = []
         model_state_dict = self.dit.state_dict()
         
@@ -297,12 +297,12 @@ class FluxImagePipeline(BasePipeline):
     def preprocess_masks(self, masks, height, width, dim):
         out_masks = []
         for mask in masks:
-            mask = self.preprocess_image(mask.resize((width, height), resample=Image.NEAREST)).mean(dim=1, keepdim=True) > 0
-            #mask = F.interpolate(mask.unsqueeze(0), size=(height, width,3), mode='nearest').squeeze(0).squeeze(0)
-            #d = mask.device
-            #mask = np.array(mask.cpu())
+            #mask = self.preprocess_image(mask.resize((width, height), resample=Image.NEAREST)).mean(dim=1, keepdim=True) > 0
+            mask = F.interpolate(mask.unsqueeze(0), size=(height, width,3), mode='nearest').squeeze(0).squeeze(0)
+            d = mask.device
+            mask = np.array(mask.cpu())
             
-            #mask = self.preprocess_image(mask).mean(dim=1, keepdim=True) > 0
+            mask = self.preprocess_image(mask).mean(dim=1, keepdim=True) > 0
         
             mask = mask.repeat(1, dim, 1, 1).to(device=self.device, dtype=self.torch_dtype)
             out_masks.append(mask)

@@ -212,7 +212,7 @@ class FluxJointTransformerBlock(torch.nn.Module):
         super().__init__()
         self.norm1_a = AdaLayerNorm(dim)
         self.norm1_b = AdaLayerNorm(dim)
-
+        self.norm1_c = AdaLayerNorm(dim)
         self.attn = FluxJointAttention(dim, dim, num_attention_heads, dim // num_attention_heads)
 
         self.norm2_a = torch.nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
@@ -229,14 +229,22 @@ class FluxJointTransformerBlock(torch.nn.Module):
             torch.nn.Linear(dim*4, dim)
         )
 
+        self.norm2_c = torch.nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.ff_c = torch.nn.Sequential(
+            torch.nn.Linear(dim, dim*4),
+            torch.nn.GELU(approximate="tanh"),
+            torch.nn.Linear(dim*4, dim)
+        )
 
-    def forward(self, hidden_states_a, hidden_states_b, temb, image_rotary_emb, attn_mask=None, ipadapter_kwargs_list=None):
+
+    def forward(self, hidden_states_a, hidden_states_b,hidden_states_c, temb, image_rotary_emb, attn_mask=None, ipadapter_kwargs_list=None):
         norm_hidden_states_a, gate_msa_a, shift_mlp_a, scale_mlp_a, gate_mlp_a = self.norm1_a(hidden_states_a, emb=temb)
         norm_hidden_states_b, gate_msa_b, shift_mlp_b, scale_mlp_b, gate_mlp_b = self.norm1_b(hidden_states_b, emb=temb)
-
+        norm_hidden_states_c, gate_msa_c, shift_mlp_c, scale_mlp_c, gate_mlp_c = self.norm1_c(hidden_states_c, emb=temb)
         # Attention
-        attn_output_a, attn_output_b = self.attn(norm_hidden_states_a, norm_hidden_states_b, image_rotary_emb, attn_mask, ipadapter_kwargs_list)
-
+        attn_output_a, attn_output_b = self.attn(torch.cat([norm_hidden_states_a,norm_hidden_states_c],dim=1), norm_hidden_states_b, image_rotary_emb, attn_mask, ipadapter_kwargs_list)
+        attn_output_c = attn_output_a[:, :hidden_states_c.shape[1]]
+        attn_output_a = attn_output_a[:, hidden_states_c.shape[1]:]
         # Part A
         hidden_states_a = hidden_states_a + gate_msa_a * attn_output_a
         norm_hidden_states_a = self.norm2_a(hidden_states_a) * (1 + scale_mlp_a) + shift_mlp_a
@@ -247,7 +255,10 @@ class FluxJointTransformerBlock(torch.nn.Module):
         norm_hidden_states_b = self.norm2_b(hidden_states_b) * (1 + scale_mlp_b) + shift_mlp_b
         hidden_states_b = hidden_states_b + gate_mlp_b * self.ff_b(norm_hidden_states_b)
 
-        return hidden_states_a, hidden_states_b
+        hidden_states_c = hidden_states_c + gate_msa_c * attn_output_c
+        norm_hidden_states_c = self.norm2_c(hidden_states_c) * (1 + scale_mlp_c) + shift_mlp_c
+        hidden_states_c = hidden_states_c + gate_mlp_c * self.ff_c(norm_hidden_states_c)
+        return hidden_states_a, hidden_states_b,hidden_states_c
 
 
 
