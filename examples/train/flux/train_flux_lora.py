@@ -245,6 +245,7 @@ class LightningModel(LightningModelForT2ILoRA):
         loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
         loss = loss * self.pipe.scheduler.training_weight(timestep)
         self.total_loss += loss
+        
         # Record log
         self.log("train_loss", self.total_loss/self.step, prog_bar=True)
         if (self.step+1)%1000==0:
