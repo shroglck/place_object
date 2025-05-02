@@ -4,6 +4,7 @@ import torch, os
 from ..data.simple_text_image import TextImageDataset
 from modelscope.hub.api import HubApi
 from ..models.utils import load_state_dict
+from torch.nn import init
 
 
 
@@ -49,10 +50,35 @@ class LightningModelForT2ILoRA(pl.LightningModule):
         model = inject_adapter_in_model(lora_config, model)
         #print(model)
         try:
+            # Counter for stats
+            trainable_count = 0
+            total_count = 0
+            
+            # Then unfreeze and initialize parameters with the pattern in their name
+            patterns = ["bbox","_c","lora"]
+            for name, param in model.named_parameters():
+                total_count += 1
+                for pattern in patterns:
+                    if pattern in name:
+                        
+                        param.requires_grad = True
+                        trainable_count += 1
+                        
+                        # Initialize the parameter if requested
+                        if True:
+                            if len(param.shape) > 1:
+                                # For weight matrices
+                                init.xavier_normal_(param)
+                            else:
+                                # For bias vectors
+                                init.zeros_(param)
+                    #else:
+                        #param.requires_grad = False
+
             for param in model.bbox_embedder.parameters():
                 param.requires_grad = True
 
-            for param in model.proj_out_bbox.parameters():
+            for param in model.final_bbox_out.parameters():
                 param.requires_grad = True
 
             for param in model.parameters():

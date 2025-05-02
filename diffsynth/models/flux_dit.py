@@ -212,7 +212,10 @@ class FluxJointTransformerBlock(torch.nn.Module):
         super().__init__()
         self.norm1_a = AdaLayerNorm(dim)
         self.norm1_b = AdaLayerNorm(dim)
-        self.norm1_c = AdaLayerNorm(dim)
+        self.norm1_c = AdaLayerNorm(512)
+        self.bbox_temb = torch.nn.Linear(dim, 512)
+        self.bbox_to_dim = torch.nn.Linear(512, dim)
+        self.dim_to_bbox = torch.nn.Linear(dim, 512)
         self.attn = FluxJointAttention(dim, dim, num_attention_heads, dim // num_attention_heads)
 
         self.norm2_a = torch.nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
@@ -229,22 +232,29 @@ class FluxJointTransformerBlock(torch.nn.Module):
             torch.nn.Linear(dim*4, dim)
         )
 
-        self.norm2_c = torch.nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.norm_c_1 = torch.nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.norm_c_2 = torch.nn.LayerNorm(512, elementwise_affine=False, eps=1e-6)
+        self.norm2_c = torch.nn.LayerNorm(512, elementwise_affine=False, eps=1e-6)
         self.ff_c = torch.nn.Sequential(
-            torch.nn.Linear(dim, dim*4),
+            torch.nn.Linear(512, 512),
             torch.nn.GELU(approximate="tanh"),
-            torch.nn.Linear(dim*4, dim)
+            torch.nn.Linear(512, 512)
         )
 
 
     def forward(self, hidden_states_a, hidden_states_b,hidden_states_c, temb, image_rotary_emb, attn_mask=None, ipadapter_kwargs_list=None):
         norm_hidden_states_a, gate_msa_a, shift_mlp_a, scale_mlp_a, gate_mlp_a = self.norm1_a(hidden_states_a, emb=temb)
         norm_hidden_states_b, gate_msa_b, shift_mlp_b, scale_mlp_b, gate_mlp_b = self.norm1_b(hidden_states_b, emb=temb)
-        norm_hidden_states_c, gate_msa_c, shift_mlp_c, scale_mlp_c, gate_mlp_c = self.norm1_c(hidden_states_c, emb=temb)
+        #hidden_states_c = self.bbox_to_dim(hidden_states_c)
+        norm_hidden_states_c, gate_msa_c, shift_mlp_c, scale_mlp_c, gate_mlp_c = self.norm1_c(hidden_states_c, emb=self.bbox_temb(temb))
         # Attention
+        norm_hidden_states_c = self.bbox_to_dim(norm_hidden_states_c)
+        norm_hidden_states_c = self.norm_c_1(norm_hidden_states_c)
         attn_output_a, attn_output_b = self.attn(torch.cat([norm_hidden_states_a,norm_hidden_states_c],dim=1), norm_hidden_states_b, image_rotary_emb, attn_mask, ipadapter_kwargs_list)
-        attn_output_c = attn_output_a[:, :hidden_states_c.shape[1]]
-        attn_output_a = attn_output_a[:, hidden_states_c.shape[1]:]
+        attn_output_c = attn_output_a[:, -hidden_states_c.shape[1]:]
+        attn_output_a = attn_output_a[:, :-hidden_states_c.shape[1]]
+        #print(attn_output_c.shape,attn_output_a.shape)
+        attn_output_c = self.norm_c_2(self.dim_to_bbox(attn_output_c))
         # Part A
         hidden_states_a = hidden_states_a + gate_msa_a * attn_output_a
         norm_hidden_states_a = self.norm2_a(hidden_states_a) * (1 + scale_mlp_a) + shift_mlp_a
@@ -399,13 +409,13 @@ class FluxDiT(torch.nn.Module):
         self.pooled_text_embedder = torch.nn.Sequential(torch.nn.Linear(768, 3072), torch.nn.SiLU(), torch.nn.Linear(3072, 3072))
         self.context_embedder = torch.nn.Linear(4096, 3072)
         self.x_embedder = torch.nn.Linear(64, 3072)
-        self.bbox_embedder = FourierBBoxEmbedding(input_dim=4, fourier_dim=8, output_dim=3072)
+        self.bbox_embedder = FourierBBoxEmbedding(input_dim=4, fourier_dim=8, output_dim=512)
 
         self.blocks = torch.nn.ModuleList([FluxJointTransformerBlock(3072, 24) for _ in range(19)])
         self.single_blocks = torch.nn.ModuleList([FluxSingleTransformerBlock(3072, 24) for _ in range(38)])
 
         self.final_norm_out = AdaLayerNormContinuous(3072)
-        self.final_bbox_out = torch.nn.Linear(3072, 4)
+        self.final_bbox_out = torch.nn.Linear(512, 4)
         self.final_proj_out = torch.nn.Linear(3072, 64)
 
 

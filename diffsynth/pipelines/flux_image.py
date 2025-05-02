@@ -138,28 +138,32 @@ class FluxImagePipeline(BasePipeline):
     def denoising_model(self):
         return self.dit
 
-    def load_specific_layers(self, target_layers=["final_bbox_out", "bbox_embedder"]):
+    def load_specific_layers(self, target_layers=["final_bbox_out", "bbox_embedder", "_c"]):
         """
         Load weights only for specific layers from a weights dictionary.
         
         Args:
             model: The model to load weights into
             weights_dict: Dictionary containing weights
-            target_layers: List of layer names to load weights for
+            target_layers: List of layer names or patterns to load weights for
         
         Returns:
             model: The model with updated weights
             loaded_keys: List of parameter keys that were loaded
         """
-        weights_dict = torch.load("/data/shresth/DiffSynth-Studio/lightning_logs/version_69/checkpoints/epoch=26-step=20250.ckpt")
+        weights_dict = torch.load("/data/shresth/DiffSynth-Studio/lightning_logs/version_85/checkpoints/epoch=0-step=188.ckpt")
         loaded_keys = []
         model_state_dict = self.dit.state_dict()
-        
-        # Filter weights dictionary to only include keys for target layers
-        for key in model_state_dict.keys():
-            # Check if the key belongs to any of the target layers
+        print(model_state_dict.keys())
+        cnt = 0
+        for cn in weights_dict.keys():
+            if "_c" in cn:
+                cnt+=1
+        print(cnt)         # Filter weights dictionary to include keys that match any pattern in target_layers
+        for key in weights_dict.keys():
+            # Check if the key contains any of the target layer patterns
             if any(target_layer in key for target_layer in target_layers):
-                if key in weights_dict:
+                if key in model_state_dict:
                     # Get the target parameter
                     param = model_state_dict[key]
                     # Get the weight from the dictionary
@@ -171,8 +175,14 @@ class FluxImagePipeline(BasePipeline):
                     # Update the model's state dict
                     model_state_dict[key] = weight
                     loaded_keys.append(key)
+        
+        print(f"Total of {len(loaded_keys)} keys loaded")
+        print("First few loaded keys:", loaded_keys[:5] if len(loaded_keys) > 5 else loaded_keys)
+        
         # Load the filtered state dict back into the model
         self.dit.load_state_dict(model_state_dict, strict=False)
+        
+        return loaded_keys
     
     def fetch_models(self, model_manager: ModelManager, controlnet_config_units: List[ControlNetConfigUnit]=[], prompt_refiner_classes=[], prompt_extender_classes=[]):
         self.text_encoder_1 = model_manager.fetch_model("sd3_text_encoder_1")
@@ -664,7 +674,7 @@ def lets_dance_flux(
         prompt_emb = dit.context_embedder(prompt_emb)
         image_rotary_emb = dit.pos_embedder(torch.cat((text_ids, image_ids,bbox_ids), dim=1))
         attention_mask = None
-    hidden_states = torch.cat([hidden_states, bbox_emb], dim=1)
+    #hidden_states = torch.cat([hidden_states, bbox_emb], dim=1)
     # TeaCache
     if tea_cache is not None:
         tea_cache_update = tea_cache.check(dit, hidden_states, conditioning)
@@ -678,9 +688,10 @@ def lets_dance_flux(
         # Joint Blocks
         for block_id, block in enumerate(dit.blocks):
             #print(hidden_states.shape)
-            hidden_states, prompt_emb = block(
+            hidden_states, prompt_emb,bbox_emb = block(
                 hidden_states,
                 prompt_emb,
+                bbox_emb,
                 conditioning,
                 image_rotary_emb,
                 attention_mask,
@@ -693,6 +704,10 @@ def lets_dance_flux(
 
         # Single Blocks
         hidden_states = torch.cat([prompt_emb, hidden_states], dim=1)
+        if attention_mask is not None:
+            attention_mask = attention_mask[:,:, :hidden_states.shape[1], :hidden_states.shape[1]]
+        image_rotary_emb = image_rotary_emb[:,:, :hidden_states.shape[1]]
+    
         num_joint_blocks = len(dit.blocks)
         for block_id, block in enumerate(dit.single_blocks):
             hidden_states, prompt_emb = block(
@@ -712,10 +727,10 @@ def lets_dance_flux(
             tea_cache.store(hidden_states)
 
     hidden_states = dit.final_norm_out(hidden_states, conditioning)
-    hidden_states_image = hidden_states[:, :-bbox_emb.shape[1]]
-    hidden_states_bbox = hidden_states[:, -bbox_emb.shape[1]:]
-    hidden_states = dit.final_proj_out(hidden_states_image)
-    hidden_states_bbox = dit.final_bbox_out(hidden_states_bbox)
+    #hidden_states_image = hidden_states[:, :-bbox_emb.shape[1]]
+    #hidden_states_bbox = hidden_states[:, -bbox_emb.shape[1]:]
+    hidden_states = dit.final_proj_out(hidden_states)
+    hidden_states_bbox = dit.final_bbox_out(bbox_emb)
     
     hidden_states = dit.unpatchify(hidden_states, height, width)
 
