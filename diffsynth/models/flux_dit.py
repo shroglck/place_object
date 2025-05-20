@@ -143,8 +143,141 @@ class RoPEEmbedding(torch.nn.Module):
         return emb.unsqueeze(1)
 
 
-
 class FluxJointAttention(torch.nn.Module):
+    def __init__(self, dim_a, dim_b, num_heads, head_dim, only_out_a=False):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.only_out_a = only_out_a
+
+        self.a_to_qkv = torch.nn.Linear(dim_a, dim_a * 3)
+        self.b_to_qkv = torch.nn.Linear(dim_b, dim_b * 3)
+        self.c_to_qkv = torch.nn.Linear(512, dim_a * 3)
+        self.norm_q_a = RMSNorm(head_dim, eps=1e-6)
+        self.norm_k_a = RMSNorm(head_dim, eps=1e-6)
+        self.norm_q_b = RMSNorm(head_dim, eps=1e-6)
+        self.norm_k_b = RMSNorm(head_dim, eps=1e-6)
+        self.norm_q_c = RMSNorm(head_dim, eps=1e-6)
+        self.norm_k_c = RMSNorm(head_dim, eps=1e-6)
+
+        self.a_to_out = torch.nn.Linear(dim_a, dim_a)
+        self.c_to_out = torch.nn.Linear(dim_a, 512)
+        if not only_out_a:
+            self.b_to_out = torch.nn.Linear(dim_b, dim_b)
+
+
+    def apply_rope(self, xq, xk, freqs_cis):
+        xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
+        xk_ = xk.float().reshape(*xk.shape[:-1], -1, 1, 2)
+        xq_out = freqs_cis[..., 0] * xq_[..., 0] + freqs_cis[..., 1] * xq_[..., 1]
+        xk_out = freqs_cis[..., 0] * xk_[..., 0] + freqs_cis[..., 1] * xk_[..., 1]
+        return xq_out.reshape(*xq.shape).type_as(xq), xk_out.reshape(*xk.shape).type_as(xk)
+
+    def forward(self, hidden_states_a, hidden_states_b,hidden_states_c, image_rotary_emb, attn_mask=None, ipadapter_kwargs_list=None):
+        batch_size = hidden_states_a.shape[0]
+
+        # Part A
+        qkv_a = self.a_to_qkv(hidden_states_a)
+        qkv_a = qkv_a.view(batch_size, -1, 3 * self.num_heads, self.head_dim).transpose(1, 2)
+        q_a, k_a, v_a = qkv_a.chunk(3, dim=1)
+        q_a, k_a = self.norm_q_a(q_a), self.norm_k_a(k_a)
+
+        # Part B
+        qkv_b = self.b_to_qkv(hidden_states_b)
+        qkv_b = qkv_b.view(batch_size, -1, 3 * self.num_heads, self.head_dim).transpose(1, 2)
+        q_b, k_b, v_b = qkv_b.chunk(3, dim=1)
+        q_b, k_b = self.norm_q_b(q_b), self.norm_k_b(k_b)
+        # Part C
+        qkv_c = self.c_to_qkv(hidden_states_c)
+        qkv_c = qkv_c.view(batch_size, -1, 3 * self.num_heads, self.head_dim).transpose(1, 2)
+        q_c, k_c, v_c = qkv_c.chunk(3, dim=1)
+        q_c, k_c = self.norm_q_c(q_c), self.norm_k_c(k_c)
+
+        q = torch.concat([q_b, q_a,q_c], dim=2)
+        k = torch.concat([k_b, k_a,k_c], dim=2)
+        v = torch.concat([v_b, v_a,v_c], dim=2)
+
+        q, k = self.apply_rope(q, k, image_rotary_emb)
+
+        hidden_states = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, self.num_heads * self.head_dim)
+        hidden_states = hidden_states.to(q.dtype)
+        hidden_states_b, hidden_states_a,hidden_states_c = hidden_states[:, :hidden_states_b.shape[1]], hidden_states[:, hidden_states_b.shape[1]:hidden_states_b.shape[1]+hidden_states_a.shape[1]],hidden_states[:, hidden_states_b.shape[1]+hidden_states_a.shape[1]:]
+        if ipadapter_kwargs_list is not None:
+            hidden_states_a = interact_with_ipadapter(hidden_states_a, q_a, **ipadapter_kwargs_list)
+        hidden_states_a = self.a_to_out(hidden_states_a)
+        hidden_states_c = self.c_to_out(hidden_states_c)
+        if self.only_out_a:
+            return hidden_states_a
+        else:
+            hidden_states_b = self.b_to_out(hidden_states_b)
+            return hidden_states_a, hidden_states_b,hidden_states_c
+
+
+
+class FluxJointTransformerBlock(torch.nn.Module):
+    def __init__(self, dim, num_attention_heads):
+        super().__init__()
+        self.norm1_a = AdaLayerNorm(dim)
+        self.norm1_b = AdaLayerNorm(dim)
+        self.norm1_c = AdaLayerNorm(512)
+        self.attn = FluxJointAttention(dim, dim, num_attention_heads, dim // num_attention_heads)
+
+        self.norm2_a = torch.nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.ff_a = torch.nn.Sequential(
+            torch.nn.Linear(dim, dim*4),
+            torch.nn.GELU(approximate="tanh"),
+            torch.nn.Linear(dim*4, dim)
+        )
+
+        self.norm2_b = torch.nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.ff_b = torch.nn.Sequential(
+            torch.nn.Linear(dim, dim*4),
+            torch.nn.GELU(approximate="tanh"),
+            torch.nn.Linear(dim*4, dim)
+        )
+
+        #self.norm_c_1 = torch.nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        #self.norm_c_2 = torch.nn.LayerNorm(512, elementwise_affine=False, eps=1e-6)
+        self.norm2_c = torch.nn.LayerNorm(512, elementwise_affine=False, eps=1e-6)
+        self.ff_c = torch.nn.Sequential(
+            torch.nn.Linear(512, 512),
+            torch.nn.GELU(approximate="tanh"),
+            torch.nn.Linear(512, 512)
+        )
+
+
+    def forward(self, hidden_states_a, hidden_states_b,hidden_states_c, temb,bbox_temb, image_rotary_emb, attn_mask=None, ipadapter_kwargs_list=None):
+        norm_hidden_states_a, gate_msa_a, shift_mlp_a, scale_mlp_a, gate_mlp_a = self.norm1_a(hidden_states_a, emb=temb)
+        norm_hidden_states_b, gate_msa_b, shift_mlp_b, scale_mlp_b, gate_mlp_b = self.norm1_b(hidden_states_b, emb=temb)
+        #hidden_states_c = self.bbox_to_dim(hidden_states_c)
+        norm_hidden_states_c, gate_msa_c, shift_mlp_c, scale_mlp_c, gate_mlp_c = self.norm1_c(hidden_states_c, emb=bbox_temb)
+        # Attention
+        #norm_hidden_states_c = self.bbox_to_dim(norm_hidden_states_c)
+        #norm_hidden_states_c = self.norm_c_1(norm_hidden_states_c)
+        attn_output_a, attn_output_b , attn_output_c= self.attn(norm_hidden_states_a, norm_hidden_states_b,norm_hidden_states_c, image_rotary_emb, attn_mask, ipadapter_kwargs_list)
+        #attn_output_c = attn_output_a[:, -hidden_states_c.shape[1]:]
+        #attn_output_a = attn_output_a[:, :-hidden_states_c.shape[1]]
+        #print(attn_output_c.shape,attn_output_a.shape)
+        #attn_output_c = self.norm_c_2(self.dim_to_bbox(attn_output_c))
+        # Part A
+        hidden_states_a = hidden_states_a + gate_msa_a * attn_output_a
+        norm_hidden_states_a = self.norm2_a(hidden_states_a) * (1 + scale_mlp_a) + shift_mlp_a
+        hidden_states_a = hidden_states_a + gate_mlp_a * self.ff_a(norm_hidden_states_a)
+
+        # Part B
+        hidden_states_b = hidden_states_b + gate_msa_b * attn_output_b
+        norm_hidden_states_b = self.norm2_b(hidden_states_b) * (1 + scale_mlp_b) + shift_mlp_b
+        hidden_states_b = hidden_states_b + gate_mlp_b * self.ff_b(norm_hidden_states_b)
+
+        hidden_states_c = hidden_states_c + gate_msa_c * attn_output_c
+        norm_hidden_states_c = self.norm2_c(hidden_states_c) * (1 + scale_mlp_c) + shift_mlp_c
+        hidden_states_c = hidden_states_c + gate_mlp_c * self.ff_c(norm_hidden_states_c)
+        return hidden_states_a, hidden_states_b,hidden_states_c
+
+
+
+"""class FluxJointAttention(torch.nn.Module):
     def __init__(self, dim_a, dim_b, num_heads, head_dim, only_out_a=False):
         super().__init__()
         self.num_heads = num_heads
@@ -268,10 +401,7 @@ class FluxJointTransformerBlock(torch.nn.Module):
         hidden_states_c = hidden_states_c + gate_msa_c * attn_output_c
         norm_hidden_states_c = self.norm2_c(hidden_states_c) * (1 + scale_mlp_c) + shift_mlp_c
         hidden_states_c = hidden_states_c + gate_mlp_c * self.ff_c(norm_hidden_states_c)
-        return hidden_states_a, hidden_states_b,hidden_states_c
-
-
-
+        return hidden_states_a, hidden_states_b,hidden_states_c"""
 class FluxSingleAttention(torch.nn.Module):
     def __init__(self, dim_a, dim_b, num_heads, head_dim):
         super().__init__()
@@ -417,6 +547,8 @@ class FluxDiT(torch.nn.Module):
         self.final_norm_out = AdaLayerNormContinuous(3072)
         self.final_bbox_out = torch.nn.Linear(512, 4)
         self.final_proj_out = torch.nn.Linear(3072, 64)
+        self.bbox_temb = torch.nn.Linear(3072, 512)
+        
 
 
     def patchify(self, hidden_states):

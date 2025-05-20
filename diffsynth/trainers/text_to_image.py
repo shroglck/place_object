@@ -5,6 +5,7 @@ from ..data.simple_text_image import TextImageDataset
 from modelscope.hub.api import HubApi
 from ..models.utils import load_state_dict
 from torch.nn import init
+from prodigyopt import Prodigy
 
 
 
@@ -55,7 +56,7 @@ class LightningModelForT2ILoRA(pl.LightningModule):
             total_count = 0
             
             # Then unfreeze and initialize parameters with the pattern in their name
-            patterns = ["bbox","_c","lora"]
+            patterns = ["bbox","_c","lora","c_"]
             for name, param in model.named_parameters():
                 total_count += 1
                 for pattern in patterns:
@@ -136,7 +137,7 @@ class LightningModelForT2ILoRA(pl.LightningModule):
     def configure_optimizers(self):
         trainable_modules = filter(lambda p: p.requires_grad, self.pipe.denoising_model().parameters())
         
-        optimizer = torch.optim.AdamW(trainable_modules, lr=self.learning_rate)
+        optimizer = Prodigy(trainable_modules, lr=self.learning_rate)#torch.optim.AdamW(trainable_modules, lr=self.learning_rate)
         return optimizer
     
 
@@ -353,7 +354,7 @@ def launch_training_task(model, args):
         log_every_n_steps=1,
         callbacks=[pl.pytorch.callbacks.ModelCheckpoint(save_top_k=-1)],
         logger=logger,
-        #gradient_clip_val=1, gradient_clip_algorithm="value"
+        gradient_clip_val=100.0, gradient_clip_algorithm="value"
     )
     trainer.fit(model=model, train_dataloaders=train_loader)
 

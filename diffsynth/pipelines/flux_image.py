@@ -17,6 +17,65 @@ from transformers.models.t5.modeling_t5 import T5LayerNorm, T5DenseActDense, T5D
 from ..models.flux_dit import RMSNorm
 from ..vram_management import enable_vram_management, AutoWrappedModule, AutoWrappedLinear
 
+def calculate_iou(boxes1, boxes2):
+    """
+    Calculate IoU between corresponding bounding boxes in two tensors.
+    
+    Args:
+        boxes1 (torch.Tensor): Ground truth boxes with shape [n, 4], format [x1, y1, x2, y2]
+        boxes2 (torch.Tensor): Predicted boxes with shape [n, 4], format [x1, y1, x2, y2]
+        
+    Returns:
+        torch.Tensor: IoU values for each pair of boxes with shape [n]
+    """
+    # Ensure inputs are tensors with the same first dimension
+    assert boxes1.shape[0] == boxes2.shape[0], f"Expected same number of boxes, got {boxes1.shape[0]} and {boxes2.shape[0]}"
+    assert boxes1.shape[1] == 4 and boxes2.shape[1] == 4, f"Expected boxes with 4 coordinates, got shapes {boxes1.shape} and {boxes2.shape}"
+    
+    # Calculate areas for all boxes in one go
+    area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])  # [n]
+    area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])  # [n]
+    
+    # Calculate intersection coordinates
+    x1 = torch.max(boxes1[:, 0], boxes2[:, 0])  # [n]
+    y1 = torch.max(boxes1[:, 1], boxes2[:, 1])  # [n]
+    x2 = torch.min(boxes1[:, 2], boxes2[:, 2])  # [n]
+    y2 = torch.min(boxes1[:, 3], boxes2[:, 3])  # [n]
+    
+    # Calculate intersection areas, handling non-overlapping cases
+    w = torch.clamp(x2 - x1, min=0)  # [n]
+    h = torch.clamp(y2 - y1, min=0)  # [n]
+    intersection = w * h  # [n]
+    
+    # Calculate union areas
+    union = area1 + area2 - intersection  # [n]
+    
+    # Calculate IoU
+    iou = intersection / union  # [n]
+    
+    return iou
+
+
+
+def calculate_batch_iou(gt_boxes, pred_boxes):
+    """
+    Calculate IoU for multiple pairs of ground truth and predicted bounding boxes.
+    
+    Args:
+        gt_boxes (list): List of ground truth boxes, each in format [x1, y1, x2, y2]
+        pred_boxes (list): List of predicted boxes, each in format [x1, y1, x2, y2]
+    
+    Returns:
+        list: List of IoU values for each pair of boxes
+    """
+    assert len(gt_boxes) == len(pred_boxes), "Number of ground truth and predicted boxes must be the same"
+    
+    iou_values = []
+    for gt_box, pred_box in zip(gt_boxes, pred_boxes):
+        iou_values.append(calculate_iou(gt_box, pred_box))
+    
+    return iou_values
+
 
 class FluxImagePipeline(BasePipeline):
 
@@ -138,7 +197,7 @@ class FluxImagePipeline(BasePipeline):
     def denoising_model(self):
         return self.dit
 
-    def load_specific_layers(self, target_layers=["final_bbox_out", "bbox_embedder", "_c"]):
+    def load_specific_layers(self, target_layers=["final_bbox_out", "bbox_embedder", "_c","c_"]):
         """
         Load weights only for specific layers from a weights dictionary.
         
@@ -148,18 +207,17 @@ class FluxImagePipeline(BasePipeline):
             target_layers: List of layer names or patterns to load weights for
         
         Returns:
-            model: The model with updated weights
+            model: The model with updated weightsImag
             loaded_keys: List of parameter keys that were loaded
         """
-        weights_dict = torch.load("/data/shresth/DiffSynth-Studio/lightning_logs/version_85/checkpoints/epoch=0-step=188.ckpt")
+        weights_dict = torch.load("/data/shresth/DiffSynth-Studio/lightning_logs/version_22/checkpoints/epoch=2-step=9000.ckpt")
         loaded_keys = []
         model_state_dict = self.dit.state_dict()
-        print(model_state_dict.keys())
+        #print(model_state_dict.keys())
         cnt = 0
         for cn in weights_dict.keys():
             if "_c" in cn:
                 cnt+=1
-        print(cnt)         # Filter weights dictionary to include keys that match any pattern in target_layers
         for key in weights_dict.keys():
             # Check if the key contains any of the target layer patterns
             if any(target_layer in key for target_layer in target_layers):
@@ -176,7 +234,7 @@ class FluxImagePipeline(BasePipeline):
                     model_state_dict[key] = weight
                     loaded_keys.append(key)
         
-        print(f"Total of {len(loaded_keys)} keys loaded")
+        print(f"Total of {len(loaded_keys)} keys loaded",loaded_keys)
         print("First few loaded keys:", loaded_keys[:5] if len(loaded_keys) > 5 else loaded_keys)
         
         # Load the filtered state dict back into the model
@@ -531,7 +589,8 @@ class FluxImagePipeline(BasePipeline):
         
         self.load_models_to_device(['vae_decoder'])
         image = self.decode_image(latents, **tiler_kwargs)
-        print(bbox_latents/2+0.5)
+
+        print(calculate_iou(bbox.squeeze(0)/2+0.5,bbox_latents.squeeze(0)/2+0.5),bbox_latents)
         # Offload all models
         self.load_models_to_device([])
         return image

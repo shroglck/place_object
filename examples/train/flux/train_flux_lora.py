@@ -6,7 +6,7 @@ import torch.nn as nn
 from torch.nn import init
 os.environ["TOKENIZERS_PARALLELISM"] = "True"
 
-def set_trainable_parameters(model, pattern="_c", initialize=True):
+def set_trainable_parameters(model, patterns="_c", initialize=True):
     """
     Sets parameters with a specific pattern in their name to be trainable,
     while freezing all other parameters. Optionally initializes the trainable parameters.
@@ -17,8 +17,6 @@ def set_trainable_parameters(model, pattern="_c", initialize=True):
         initialize: Whether to initialize the trainable parameters
     """
     # First freeze all parameters
-    for param in model.parameters():
-        param.requires_grad = False
     
     # Counter for stats
     trainable_count = 0
@@ -27,18 +25,22 @@ def set_trainable_parameters(model, pattern="_c", initialize=True):
     # Then unfreeze and initialize parameters with the pattern in their name
     for name, param in model.named_parameters():
         total_count += 1
-        if pattern in name:
-            param.requires_grad = True
-            trainable_count += 1
-            
-            # Initialize the parameter if requested
-            if initialize:
-                if len(param.shape) > 1:
-                    # For weight matrices
-                    init.xavier_normal_(param)
-                else:
-                    # For bias vectors
-                    init.zeros_(param)
+        for pattern in patterns:
+            if pattern in name:
+                print(name)
+                param.requires_grad = True
+                trainable_count += 1
+                
+                # Initialize the parameter if requested
+                if initialize:
+                    if len(param.shape) > 1:
+                        # For weight matrices
+                        init.xavier_normal_(param)
+                    else:
+                        # For bias vectors
+                        init.zeros_(param)
+            else:
+                param.requires_grad = False
     
     print(f"Made {trainable_count} out of {total_count} parameters trainable.")
     print(f"Trainable parameters have '{pattern}' in their name.")
@@ -79,7 +81,9 @@ class LightningModel(LightningModelForT2ILoRA):
 
 
         self.freeze_parameters()
-        set_trainable_parameters(self.pipe.denoising_model(), pattern="_c", initialize=True)
+        #self.pipe.eval()
+        #self.pipe.denoising_model().train()
+        #self.pipe = set_trainable_parameters(self.pipe, patterns=["_c","bbox"], initialize=True)
         self.pipe.denoising_model().bbox_embedder.projection.requires_grad = True
         self.pipe.denoising_model().final_bbox_out.requires_grad = True
         self.add_lora_to_model(
@@ -91,6 +95,19 @@ class LightningModel(LightningModelForT2ILoRA):
             pretrained_lora_path=pretrained_lora_path,
             state_dict_converter=FluxLoRAConverter.align_to_diffsynth_format
         )
+        #set_trainable_parameters(self.pipe, patterns=["_c","bbox","lora"], initialize=True)
+        print(sum(p.numel() for p in self.pipe.parameters() if p.requires_grad)
+)   
+    def on_after_backward(self):
+        total_norm = 0.0
+        for p in self.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        total_norm = total_norm ** 0.5
+
+        # Log it to Lightning's logger (e.g., TensorBoard)
+        self.log("train/grad_l2_norm", total_norm, on_step=True, on_epoch=False, prog_bar=True, logger=True)
     def training_step(self, batch, batch_idx):
         # Data
         text, image = batch["text"], batch["image"]
@@ -178,6 +195,7 @@ def lets_dance_flux(
     #print(text_ids)
     bbox_emb = dit.bbox_embedder(bbox_emb)
     conditioning = dit.time_embedder(timestep, hidden_states.dtype) + dit.pooled_text_embedder(pooled_prompt_emb)
+    bbox_condtioning = dit.bbox_temb(conditioning)
     if dit.guidance_embedder is not None:
         guidance = guidance * 1000
         conditioning = conditioning + dit.guidance_embedder(guidance, hidden_states.dtype)
@@ -201,7 +219,7 @@ def lets_dance_flux(
         if dit.training and use_gradient_checkpointing:
             hidden_states, prompt_emb,bbox_emb = torch.utils.checkpoint.checkpoint(
                 create_custom_forward(block),
-                hidden_states, prompt_emb,bbox_emb, conditioning, image_rotary_emb, attention_mask,
+                hidden_states, prompt_emb,bbox_emb, conditioning,bbox_condtioning, image_rotary_emb, attention_mask,
                 use_reentrant=False,
             )
         else:
