@@ -3,6 +3,8 @@ from diffsynth.trainers.text_to_image import LightningModelForT2ILoRA, add_gener
 from diffsynth.models.lora import FluxLoRAConverter
 import torch, os, argparse
 import torch.nn as nn
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
 from torch.nn import init
 os.environ["TOKENIZERS_PARALLELISM"] = "True"
 
@@ -56,6 +58,8 @@ class LightningModel(LightningModelForT2ILoRA):
     ):
         super().__init__(learning_rate=learning_rate, use_gradient_checkpointing=use_gradient_checkpointing, state_dict_converter=state_dict_converter)
         # Load models
+        self.automatic_optimization = False
+
         model_manager = ModelManager(torch_dtype=torch_dtype, device=self.device)
         if quantize is None:
             model_manager.load_models(pretrained_weights)
@@ -66,26 +70,25 @@ class LightningModel(LightningModelForT2ILoRA):
             preset_lora_path = preset_lora_path.split(",")
             for path in preset_lora_path:
                 model_manager.load_lora(path)
-            
-        self.pipe = FluxImagePipeline.from_model_manager(model_manager)
         
+        self.pipe = FluxImagePipeline.from_model_manager(model_manager)
         if quantize is not None:
             self.pipe.dit.quantize()
         
         self.pipe.scheduler.set_timesteps(1000, training=True)
-        nn.init.xavier_uniform_(self.pipe.denoising_model().bbox_embedder.projection.weight)
-        nn.init.zeros_(self.pipe.denoising_model().bbox_embedder.projection.bias)
+        #nn.init.xavier_uniform_(self.pipe.denoising_model().bbox_embedder.projection.weight)
+        #nn.init.zeros_(self.pipe.denoising_model().bbox_embedder.projection.bias)
 
-        nn.init.xavier_uniform_(self.pipe.denoising_model().final_bbox_out.weight)
-        nn.init.zeros_(self.pipe.denoising_model().final_bbox_out.bias)
+        #nn.init.xavier_uniform_(self.pipe.denoising_model().final_bbox_out.weight)
+        #nn.init.zeros_(self.pipe.denoising_model().final_bbox_out.bias)
 
 
         self.freeze_parameters()
         #self.pipe.eval()
         #self.pipe.denoising_model().train()
         #self.pipe = set_trainable_parameters(self.pipe, patterns=["_c","bbox"], initialize=True)
-        self.pipe.denoising_model().bbox_embedder.projection.requires_grad = True
-        self.pipe.denoising_model().final_bbox_out.requires_grad = True
+        #self.pipe.denoising_model().bbox_embedder.projection.requires_grad = True
+        #self.pipe.denoising_model().final_bbox_out.requires_grad = True
         self.add_lora_to_model(
             self.pipe.denoising_model(),
             lora_rank=lora_rank,
@@ -96,8 +99,12 @@ class LightningModel(LightningModelForT2ILoRA):
             state_dict_converter=FluxLoRAConverter.align_to_diffsynth_format
         )
         #set_trainable_parameters(self.pipe, patterns=["_c","bbox","lora"], initialize=True)
-        print(sum(p.numel() for p in self.pipe.parameters() if p.requires_grad)
-)   
+        if pretrained_lora_path is not None:
+            self.pipe.load_specific_layers(path = pretrained_lora_path)
+        
+        torch.compile(self.pipe.denoising_model())
+        print(sum(p.numel() for p in self.pipe.parameters() if p.requires_grad))   
+    """ 
     def on_after_backward(self):
         total_norm = 0.0
         for p in self.parameters():
@@ -107,13 +114,32 @@ class LightningModel(LightningModelForT2ILoRA):
         total_norm = total_norm ** 0.5
 
         # Log it to Lightning's logger (e.g., TensorBoard)
-        self.log("train/grad_l2_norm", total_norm, on_step=True, on_epoch=False, prog_bar=True, logger=True)
+        self.log("train/grad_l2_norm", total_norm, on_step=True, on_epoch=False, prog_bar=True, logger=True)"""
+    
+    
+    
+    
     def training_step(self, batch, batch_idx):
         # Data
-        text, image = batch["text"], batch["image"]
-        entity_masks = batch["entity_mask"]
-        bbox = 2*(torch.stack(batch['bboxes']).permute(1,0,2)-0.5)
+        optimizers = self.optimizers()
         
+        # Handle both single and multiple optimizer cases
+        if not isinstance(optimizers, list):
+            optimizers = [optimizers]
+        
+        # Get schedulers if they exist
+        schedulers = self.lr_schedulers()
+        for opt in optimizers:
+            #print(opt)
+            opt.zero_grad()
+        
+        if schedulers and not isinstance(schedulers, list):
+            schedulers = [schedulers]
+        
+        text, image = batch["text"], batch["image"]
+        
+        bbox = 2*(torch.stack(batch['bboxes']).permute(1,0,2)-0.5)
+        #print(bbox)
         
         #entity_prompts =[iii[0] for iii in batch["entity_prompt"] if iii[0] != '']
         entity_prompts = []
@@ -131,7 +157,7 @@ class LightningModel(LightningModelForT2ILoRA):
         prompt_emb = self.pipe.encode_prompt(text, positive=True)
         prompt_emb_nega = None#self.pipe.encode_prompt( "", positive=False, t5_sequence_length=77)
         #print(prompt_emb["prompt_emb"].shape,"##############")
-        eligen_kwargs_posi, eligen_kwargs_nega, fg_mask, bg_mask = self.pipe.prepare_eligen(prompt_emb_nega, entity_prompts, entity_masks, width, height, 512, False, False, 3.5)
+        eligen_kwargs_posi, eligen_kwargs_nega, fg_mask, bg_mask = self.pipe.prepare_eligen(prompt_emb_nega, entity_prompts, entity_masks, width, height, 512, False, False, 3.5,True)
         #print()
 
 
@@ -147,14 +173,14 @@ class LightningModel(LightningModelForT2ILoRA):
         extra_input = self.pipe.prepare_extra_input(latents)
         noisy_latents = self.pipe.scheduler.add_noise(latents, noise, timestep)
         noisy_bbox = self.pipe.scheduler.add_noise(bbox, noise_2, timestep)
-        training_bbox = self.pipe.scheduler.training_target(bbox, noisy_bbox, timestep)
+        training_bbox = self.pipe.scheduler.training_target(bbox, noise_2, timestep)
         training_target = self.pipe.scheduler.training_target(latents, noise, timestep)
 
         # Compute loss
         
         noise_pred,noise_pred_bbox = lets_dance_flux(
                     dit=self.pipe.denoising_model(),
-                    bbox_emb=bbox,
+                    bbox_emb=noisy_bbox,
                     hidden_states=noisy_latents, timestep=timestep,
                     **prompt_emb,**extra_input, **eligen_kwargs_posi,
                     conditining = 3.5,
@@ -166,10 +192,27 @@ class LightningModel(LightningModelForT2ILoRA):
         loss_bbox = torch.nn.functional.mse_loss(noise_pred_bbox.float(), training_bbox.float())
         loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())+loss_bbox
         loss = loss * self.pipe.scheduler.training_weight(timestep)
+        
+        
+        # Backward pass
+        self.manual_backward(loss)
+        
+        # Step all optimizers
+        for opt in optimizers:
+            self.clip_gradients(opt, gradient_clip_val=1.0, gradient_clip_algorithm="norm")
+            opt.step()
+        
+        # Step schedulers if they exist
+        if schedulers:
+            for scheduler in schedulers:
+                if scheduler is not None:
+                    scheduler.step()
         #self.total_loss += loss
         # Record log
-        self.log("train_loss", loss/self.pipe.scheduler.training_weight(timestep)-loss_bbox, prog_bar=True)
+        current_lr = self.trainer.optimizers[0].param_groups[0]['lr']
+        self.log("train_loss", loss, prog_bar=True)
         self.log("train_loss_bbox", loss_bbox, prog_bar=True)
+        self.log("train/lr", current_lr, prog_bar=True)
         return loss
     
 def lets_dance_flux(
