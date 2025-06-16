@@ -4,8 +4,12 @@ import torch, os
 from ..data.simple_text_image import TextImageDataset
 from modelscope.hub.api import HubApi
 from ..models.utils import load_state_dict
-
-
+from lightning.pytorch.strategies import FSDPStrategy
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from torch.distributed.fsdp import MixedPrecision
+from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+from torch.distributed.fsdp import CPUOffload
+from PIL import Image
 
 class LightningModelForT2ILoRA(pl.LightningModule):
     def __init__(
@@ -50,7 +54,7 @@ class LightningModelForT2ILoRA(pl.LightningModule):
         for param in model.parameters():
             # Upcast LoRA parameters into fp32
             if param.requires_grad:
-                param.data = param.to(torch.float32)
+                param.data = param.to(torch.bfloat16)
 
         # Lora pretrained lora weights
         if pretrained_lora_path is not None:
@@ -288,6 +292,7 @@ def launch_training_task(model, args):
         batch_size=args.batch_size,
         num_workers=args.dataloader_num_workers
     )
+
     # train
     if args.use_swanlab:
         from swanlab.integration.pytorch_lightning import SwanLabLogger
@@ -306,13 +311,13 @@ def launch_training_task(model, args):
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
         accelerator="gpu",
-        devices="auto",
+        devices=8,
+        strategy="ddp",
         precision=args.precision,
-        strategy=args.training_strategy,
         default_root_dir=args.output_path,
         accumulate_grad_batches=args.accumulate_grad_batches,
         log_every_n_steps=1,
-        callbacks=[pl.pytorch.callbacks.ModelCheckpoint(save_top_k=-1)],
+        callbacks=[pl.pytorch.callbacks.ModelCheckpoint(every_n_train_steps=100, save_top_k=-1)],
         logger=logger,
         #gradient_clip_val=1, gradient_clip_algorithm="value"
     )
