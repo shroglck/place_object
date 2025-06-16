@@ -14,11 +14,12 @@ from copy import deepcopy
 from transformers.models.t5.modeling_t5 import T5LayerNorm, T5DenseActDense, T5DenseGatedActDense
 from ..models.flux_dit import RMSNorm
 from ..vram_management import enable_vram_management, AutoWrappedModule, AutoWrappedLinear
+import torch.nn.functional as F
 
 
 class FluxImagePipeline(BasePipeline):
 
-    def __init__(self, device="cuda", torch_dtype=torch.float16):
+    def __init__(self, device="cuda", torch_dtype=torch.bfloat16):
         super().__init__(device=device, torch_dtype=torch_dtype, height_division_factor=16, width_division_factor=16)
         self.scheduler = FlowMatchScheduler()
         self.prompter = FluxPrompter()
@@ -257,16 +258,28 @@ class FluxImagePipeline(BasePipeline):
         return inpaint_noise
 
 
-    def preprocess_masks(self, masks, height, width, dim):
+    def preprocess_masks(self, masks, height, width, dim,test = False):
         out_masks = []
+        
         for mask in masks:
-            mask = self.preprocess_image(mask.resize((width, height), resample=Image.NEAREST)).mean(dim=1, keepdim=True) > 0
-            mask = mask.repeat(1, dim, 1, 1).to(device=self.device, dtype=self.torch_dtype)
+            if test:
+                mask = self.preprocess_image(mask.resize((width, height), resample=Image.NEAREST)).mean(dim=1, keepdim=True) > 0
+                mask = mask.repeat(1, dim, 1, 1).to(device=self.device, dtype=self.torch_dtype)
+            else:
+                temp_masks = []
+                for temp_mask in mask:
+                    temp_mask = Image.fromarray(temp_mask.to(torch.uint8).cpu().numpy())
+                    temp_mask = self.preprocess_image(temp_mask.resize((width, height), resample=Image.NEAREST)).mean(dim=1, keepdim=True) > 0
+                    temp_mask = temp_mask.repeat(1, dim, 1, 1).to(device=self.device, dtype=self.torch_dtype)
+                    temp_masks.append(temp_mask)
+
+                mask = torch.cat(temp_masks, dim=0).unsqueeze(0) 
+            
             out_masks.append(mask)
         return out_masks
 
 
-    def prepare_entity_inputs(self, entity_prompts, entity_masks, width, height, t5_sequence_length=512, enable_eligen_inpaint=False):
+    def prepare_entity_inputs(self, entity_prompts, entity_masks, width, height, t5_sequence_length=512, enable_eligen_inpaint=False, test=False):
         fg_mask, bg_mask = None, None
         if enable_eligen_inpaint:
             masks_ = deepcopy(entity_masks)
@@ -274,9 +287,19 @@ class FluxImagePipeline(BasePipeline):
             fg_masks = (fg_masks > 0).float()
             fg_mask = fg_masks.sum(dim=0, keepdim=True).repeat(1, 16, 1, 1) > 0
             bg_mask = ~fg_mask
-        entity_masks = self.preprocess_masks(entity_masks, height//8, width//8, 1)
-        entity_masks = torch.cat(entity_masks, dim=0).unsqueeze(0) # b, n_mask, c, h, w
-        entity_prompts = self.encode_prompt(entity_prompts, t5_sequence_length=t5_sequence_length)['prompt_emb'].unsqueeze(0)
+        entity_masks = self.preprocess_masks(entity_masks, height//8, width//8, 1, test=test)
+        entity_masks = torch.cat(entity_masks, dim=0) # b, n_mask, c, h, w
+        if test:
+            entity_masks = entity_masks.unsqueeze(0)
+        # entity_prompts = self.encode_prompt(entity_prompts, t5_sequence_length=t5_sequence_length)['prompt_emb'].unsqueeze(0)
+        entity_p = []
+        for i in range(len(entity_prompts)):
+            prompts = entity_prompts[i]
+            prompts = self.encode_prompt(prompts, t5_sequence_length)['prompt_emb'].unsqueeze(0)
+            entity_p.append(prompts)
+
+        entity_prompts = torch.cat(entity_p, dim=0)
+        # entity_prompts = torch.cat([self.encode_prompt(tt, t5_sequence_length)['prompt_emb'].unsqueeze(0) for tt in entity_prompts],dim=1)
         return entity_prompts, entity_masks, fg_mask, bg_mask
 
 
@@ -321,11 +344,11 @@ class FluxImagePipeline(BasePipeline):
         return controlnet_kwargs_posi, controlnet_kwargs_nega, local_controlnet_kwargs
 
 
-    def prepare_eligen(self, prompt_emb_nega, eligen_entity_prompts, eligen_entity_masks, width, height, t5_sequence_length, enable_eligen_inpaint, enable_eligen_on_negative, cfg_scale):
-        print("$$$$$$$$$$$$$$$$$$$$$$$$$$$",enable_eligen_on_negative)
+    def prepare_eligen(self, prompt_emb_nega, eligen_entity_prompts, eligen_entity_masks, width, height, t5_sequence_length, enable_eligen_inpaint, enable_eligen_on_negative, cfg_scale, test=False):
+        # print("$$$$$$$$$$$$$$$$$$$$$$$$$$$",enable_eligen_on_negative)
 
         if eligen_entity_masks is not None:
-            entity_prompt_emb_posi, entity_masks_posi, fg_mask, bg_mask = self.prepare_entity_inputs(eligen_entity_prompts, eligen_entity_masks, width, height, t5_sequence_length, enable_eligen_inpaint)
+            entity_prompt_emb_posi, entity_masks_posi, fg_mask, bg_mask = self.prepare_entity_inputs(eligen_entity_prompts, eligen_entity_masks, width, height, t5_sequence_length, enable_eligen_inpaint, test=test)
             if enable_eligen_on_negative and cfg_scale != 1.0:
                 entity_prompt_emb_nega = prompt_emb_nega['prompt_emb'].unsqueeze(1).repeat(1, entity_masks_posi.shape[1], 1, 1)
                 entity_masks_nega = entity_masks_posi
@@ -412,7 +435,7 @@ class FluxImagePipeline(BasePipeline):
         extra_input = self.prepare_extra_input(latents, guidance=embedded_guidance)
 
         # Entity control
-        eligen_kwargs_posi, eligen_kwargs_nega, fg_mask, bg_mask = self.prepare_eligen(prompt_emb_nega, eligen_entity_prompts, eligen_entity_masks, width, height, t5_sequence_length, enable_eligen_inpaint, enable_eligen_on_negative, cfg_scale)
+        eligen_kwargs_posi, eligen_kwargs_nega, fg_mask, bg_mask = self.prepare_eligen(prompt_emb_nega, eligen_entity_prompts, eligen_entity_masks, width, height, t5_sequence_length, enable_eligen_inpaint, enable_eligen_on_negative, cfg_scale, test=True)
         # IP-Adapter
         ipadapter_kwargs_list_posi, ipadapter_kwargs_list_nega = self.prepare_ipadapter(ipadapter_images, ipadapter_scale)
 
