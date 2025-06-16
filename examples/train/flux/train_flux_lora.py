@@ -1,157 +1,16 @@
 from diffsynth import ModelManager, FluxImagePipeline
 from diffsynth.trainers.text_to_image import LightningModelForT2ILoRA, add_general_parsers, launch_training_task
 from diffsynth.models.lora import FluxLoRAConverter
+from diffsynth.models import FluxDiT
+import numpy as np
+from PIL import Image
 import torch, os, argparse
 os.environ["TOKENIZERS_PARALLELISM"] = "True"
-
-def lets_dance_flux(
-    dit: FluxDiT,
-    controlnet: FluxMultiControlNetManager = None,
-    hidden_states=None,
-    timestep=None,
-    prompt_emb=None,
-    pooled_prompt_emb=None,
-    guidance=None,
-    text_ids=None,
-    image_ids=None,
-    controlnet_frames=None,
-    tiled=False,
-    tile_size=128,
-    tile_stride=64,
-    entity_prompt_emb=None,
-    entity_masks=None,
-    ipadapter_kwargs_list={},
-    tea_cache: TeaCache = None,
-    **kwargs
-):
-    if tiled:
-        def flux_forward_fn(hl, hr, wl, wr):
-            tiled_controlnet_frames = [f[:, :, hl: hr, wl: wr] for f in controlnet_frames] if controlnet_frames is not None else None
-            return lets_dance_flux(
-                dit=dit,
-                controlnet=controlnet,
-                hidden_states=hidden_states[:, :, hl: hr, wl: wr],
-                timestep=timestep,
-                prompt_emb=prompt_emb,
-                pooled_prompt_emb=pooled_prompt_emb,
-                guidance=guidance,
-                text_ids=text_ids,
-                image_ids=None,
-                controlnet_frames=tiled_controlnet_frames,
-                tiled=False,
-                **kwargs
-            )
-        return FastTileWorker().tiled_forward(
-            flux_forward_fn,
-            hidden_states,
-            tile_size=tile_size,
-            tile_stride=tile_stride,
-            tile_device=hidden_states.device,
-            tile_dtype=hidden_states.dtype
-        )
-
-
-    # ControlNet
-    if controlnet is not None and controlnet_frames is not None:
-        controlnet_extra_kwargs = {
-            "hidden_states": hidden_states,
-            "timestep": timestep,
-            "prompt_emb": prompt_emb,
-            "pooled_prompt_emb": pooled_prompt_emb,
-            "guidance": guidance,
-            "text_ids": text_ids,
-            "image_ids": image_ids,
-            "tiled": tiled,
-            "tile_size": tile_size,
-            "tile_stride": tile_stride,
-        }
-        controlnet_res_stack, controlnet_single_res_stack = controlnet(
-            controlnet_frames, **controlnet_extra_kwargs
-        )
-
-    if image_ids is None:
-        image_ids = dit.prepare_image_ids(hidden_states)
-    
-    conditioning = dit.time_embedder(timestep, hidden_states.dtype) + dit.pooled_text_embedder(pooled_prompt_emb)
-    if dit.guidance_embedder is not None:
-        guidance = guidance * 1000
-        conditioning = conditioning + dit.guidance_embedder(guidance, hidden_states.dtype)
-
-    height, width = hidden_states.shape[-2:]
-    hidden_states = dit.patchify(hidden_states)
-    hidden_states = dit.x_embedder(hidden_states)
-    #print(hidden_states.shape,prompt_emb.shape,entity_prompt_emb.shape)
-
-    if entity_prompt_emb is not None and entity_masks is not None:
-        prompt_emb, image_rotary_emb, attention_mask = dit.process_entity_masks(hidden_states, prompt_emb, entity_prompt_emb, entity_masks, text_ids, image_ids)
-        binary_mask = torch.where(attention_mask.squeeze(0).squeeze(0) == 0, 1, 0).cpu().numpy().astype(np.uint8) * 255
-    
-        # Convert to image
-        img = Image.fromarray(binary_mask)
-    
-        # Save as PNG image
-        img.save("attn.png")
-
-    else:
-        prompt_emb = dit.context_embedder(prompt_emb)
-        image_rotary_emb = dit.pos_embedder(torch.cat((text_ids, image_ids), dim=1))
-        attention_mask = None
-    # TeaCache
-    if tea_cache is not None:
-        tea_cache_update = tea_cache.check(dit, hidden_states, conditioning)
-    else:
-        tea_cache_update = False
-    #print(hidden_states.shape,prompt_emb.shape,attention_mask.shape)
-    
-    if tea_cache_update:
-        hidden_states = tea_cache.update(hidden_states)
-    else:
-        # Joint Blocks
-        for block_id, block in enumerate(dit.blocks):
-            #print(hidden_states.shape)
-            hidden_states, prompt_emb = block(
-                hidden_states,
-                prompt_emb,
-                conditioning,
-                image_rotary_emb,
-                attention_mask,
-                ipadapter_kwargs_list=ipadapter_kwargs_list.get(block_id, None)
-            )
-            # Contr
-            # olNet
-            if controlnet is not None and controlnet_frames is not None:
-                hidden_states = hidden_states + controlnet_res_stack[block_id]
-
-        # Single Blocks
-        hidden_states = torch.cat([prompt_emb, hidden_states], dim=1)
-        num_joint_blocks = len(dit.blocks)
-        for block_id, block in enumerate(dit.single_blocks):
-            hidden_states, prompt_emb = block(
-                hidden_states,
-                prompt_emb,
-                conditioning,
-                image_rotary_emb,
-                attention_mask,
-                ipadapter_kwargs_list=ipadapter_kwargs_list.get(block_id + num_joint_blocks, None)
-            )
-            # ControlNet
-            if controlnet is not None and controlnet_frames is not None:
-                hidden_states[:, prompt_emb.shape[1]:] = hidden_states[:, prompt_emb.shape[1]:] + controlnet_single_res_stack[block_id]
-        hidden_states = hidden_states[:, prompt_emb.shape[1]:]
-
-        if tea_cache is not None:
-            tea_cache.store(hidden_states)
-
-    hidden_states = dit.final_norm_out(hidden_states, conditioning)
-    hidden_states = dit.final_proj_out(hidden_states)
-    hidden_states = dit.unpatchify(hidden_states, height, width)
-
-    return hidden_states
 
 class LightningModel(LightningModelForT2ILoRA):
     def __init__(
         self,
-        torch_dtype=torch.float16, pretrained_weights=[], preset_lora_path=None,
+        torch_dtype=torch.bfloat16, pretrained_weights=[], preset_lora_path=None,
         learning_rate=1e-4, use_gradient_checkpointing=True,
         lora_rank=4, lora_alpha=4, lora_target_modules="to_q,to_k,to_v,to_out", init_lora_weights="kaiming", pretrained_lora_path=None,
         state_dict_converter=None, quantize = None
@@ -160,10 +19,10 @@ class LightningModel(LightningModelForT2ILoRA):
         # Load models
         model_manager = ModelManager(torch_dtype=torch_dtype, device=self.device)
         if quantize is None:
-            model_manager.load_models(pretrained_weights)
+            model_manager.load_models(pretrained_weights, torch_dtype=torch_dtype)
         else:
-            model_manager.load_models(pretrained_weights[1:])
-            model_manager.load_model(pretrained_weights[0], torch_dtype=quantize)
+            model_manager.load_models(pretrained_weights[1:], torch_dtype=torch_dtype)
+            model_manager.load_model(pretrained_weights[0], torch_dtype=torch_dtype)
         if preset_lora_path is not None:
             preset_lora_path = preset_lora_path.split(",")
             for path in preset_lora_path:
@@ -205,24 +64,24 @@ class LightningModel(LightningModelForT2ILoRA):
         # Data
         self.step +=1
         text, image = batch["text"], batch["image"]
-        entity_masks = batch["entity_mask"]
-        
-        #entity_prompts =[iii[0] for iii in batch["entity_prompt"] if iii[0] != '']
+
         entity_prompts = []
         entity_masks = []
-        for o,iii in enumerate(batch["entity_prompt"]):
-            if iii[0]!='':
-                entity_prompts.append(iii[0])
-                entity_masks.append(batch["entity_mask"][o])
+        for i in range(len(batch["entity_mask"][0])):
+            prompts = []
+            masks = []
+            for j in range(len(batch["entity_mask"])):
+                prompts.append(batch["entity_prompt"][j][i])
+                masks.append(batch["entity_mask"][j][i])
+            entity_prompts.append(prompts)
+            entity_masks.append(masks)
 
         height,width = 1024,1024
 
         self.pipe.device = self.device
-        # prompt_emb = self.pipe.encode_prompt(text, positive=True,t5_sequence_length=77)
-        # prompt_emb_nega = self.pipe.encode_prompt( "", positive=False, t5_sequence_length=77)
-        prompt_emb_posi, prompt_emb_nega, prompt_emb_locals = self.prepare_prompts(text, local_prompts=(), masks=(), mask_scales=(), t5_sequence_length=512, negative_prompt="", cfg_scale=1.0)
+        prompt_emb_posi, prompt_emb_nega, prompt_emb_locals = self.pipe.prepare_prompts(text, local_prompts=(), masks=(), mask_scales=(), t5_sequence_length=512, negative_prompt="", cfg_scale=1.0)
         eligen_kwargs_posi, eligen_kwargs_nega, fg_mask, bg_mask = self.pipe.prepare_eligen(prompt_emb_nega, entity_prompts, entity_masks, width, height, 512, False, False, 1.0)
-        
+
         if "latents" in batch:
             latents = batch["latents"].to(dtype=self.pipe.torch_dtype, device=self.device)
         else:
@@ -236,11 +95,10 @@ class LightningModel(LightningModelForT2ILoRA):
         training_target = self.pipe.scheduler.training_target(latents, noise, timestep)
 
         # Compute loss
-        noise_pred = lets_dance_flux(
-                    dit=self.pipe.denoising_model(),
-                    hidden_states=noisy_latents, timestep=timestep,
-                    **prompt_emb,**extra_input, **eligen_kwargs_posi,
-                )
+        noise_pred = self.pipe.denoising_model()(
+            hidden_states=noisy_latents, timestep=timestep, **prompt_emb_posi, **extra_input, **eligen_kwargs_posi,
+            use_gradient_checkpointing=self.use_gradient_checkpointing
+        )
 
         loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
         loss = loss * self.pipe.scheduler.training_weight(timestep)
