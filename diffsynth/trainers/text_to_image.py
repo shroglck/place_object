@@ -8,8 +8,6 @@ from torch.nn import init
 from prodigyopt import Prodigy
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-
-
 class LightningModelForT2ILoRA(pl.LightningModule):
     def __init__(
         self,
@@ -387,6 +385,7 @@ def launch_training_task(model, args):
         batch_size=args.batch_size,
         num_workers=args.dataloader_num_workers
     )
+
     # train
     if args.use_swanlab:
         from swanlab.integration.pytorch_lightning import SwanLabLogger
@@ -405,9 +404,9 @@ def launch_training_task(model, args):
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
         accelerator="gpu",
-        devices="auto",
+        devices=8,
+        strategy="ddp",
         precision=args.precision,
-        strategy=args.training_strategy,
         default_root_dir=args.output_path,
         accumulate_grad_batches=args.accumulate_grad_batches,
         log_every_n_steps=10,

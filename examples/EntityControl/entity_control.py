@@ -8,7 +8,6 @@ import numpy as np
 from skimage import measure
 from skimage.measure import regionprops
 
-
 import numpy as np
 import cv2
 from skimage import measure
@@ -181,5 +180,5 @@ s = random.randint(0, 1000000)
 
 seeds = range(5, 9)
 global_prompt = "A beautiful woman wearing white dress, holding a mirror, with a warm light background;"
-entity_prompts = ["A beautiful woman", "mirror", "necklace", "glasses", "earring", "white dress", "jewelry headpiece"]
-example(pipe, seeds, 7, global_prompt, entity_prompts)
+entity_prompts = [["A beautiful woman", "mirror", "necklace", "glasses", "earring", "white dress", "jewelry headpiece"]]
+example(pipe, [70], 7, global_prompt, entity_prompts)

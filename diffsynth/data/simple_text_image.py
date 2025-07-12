@@ -9,7 +9,7 @@ import json
 class TextImageDataset(torch.utils.data.Dataset):
     def __init__(self, dataset_path, steps_per_epoch=10000, height=1024, width=1024, center_crop=True, random_flip=False):
         self.steps_per_epoch = steps_per_epoch
-        file_path = "/data/shresth/ELIGEN_Data/caption-bboxbyqwen-dataset.jsonl"
+        file_path = "/data/shivansh/ELIGEN_Data/caption-bboxbyqwen-dataset.jsonl"
 
         # Read the .jsonl file line by line
         with open(file_path, "r", encoding="utf-8") as file:
@@ -90,7 +90,7 @@ class TextImageDataset(torch.utils.data.Dataset):
 
 
     def __len__(self):
-        return self.steps_per_epoch
+        return len(self.path)
 
 """
 import torch, os, torchvision

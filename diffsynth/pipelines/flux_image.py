@@ -16,6 +16,7 @@ from copy import deepcopy
 from transformers.models.t5.modeling_t5 import T5LayerNorm, T5DenseActDense, T5DenseGatedActDense
 from ..models.flux_dit import RMSNorm
 from ..vram_management import enable_vram_management, AutoWrappedModule, AutoWrappedLinear
+import torch.nn.functional as F
 
 def calculate_iou(boxes1, boxes2):
     """
@@ -79,7 +80,7 @@ def calculate_batch_iou(gt_boxes, pred_boxes):
 
 class FluxImagePipeline(BasePipeline):
 
-    def __init__(self, device="cuda", torch_dtype=torch.float16):
+    def __init__(self, device="cuda", torch_dtype=torch.bfloat16):
         super().__init__(device=device, torch_dtype=torch_dtype, height_division_factor=16, width_division_factor=16)
         self.scheduler = FlowMatchScheduler()
         self.prompter = FluxPrompter()
@@ -377,6 +378,7 @@ class FluxImagePipeline(BasePipeline):
 
     def preprocess_masks(self, masks, height, width, dim,train=True):
         out_masks = []
+        
         for mask in masks:
             if not train:
                 mask = self.preprocess_image(mask.resize((width, height), resample=Image.NEAREST)).mean(dim=1, keepdim=True) > 0

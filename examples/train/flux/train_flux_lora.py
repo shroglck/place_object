@@ -1,6 +1,9 @@
 from diffsynth import ModelManager, FluxImagePipeline
 from diffsynth.trainers.text_to_image import LightningModelForT2ILoRA, add_general_parsers, launch_training_task
 from diffsynth.models.lora import FluxLoRAConverter
+from diffsynth.models import FluxDiT
+import numpy as np
+from PIL import Image
 import torch, os, argparse
 import torch.nn as nn
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -51,7 +54,7 @@ def set_trainable_parameters(model, patterns="_c", initialize=True):
 class LightningModel(LightningModelForT2ILoRA):
     def __init__(
         self,
-        torch_dtype=torch.float16, pretrained_weights=[], preset_lora_path=None,
+        torch_dtype=torch.bfloat16, pretrained_weights=[], preset_lora_path=None,
         learning_rate=1e-4, use_gradient_checkpointing=True,
         lora_rank=4, lora_alpha=4, lora_target_modules="to_q,to_k,to_v,to_out", init_lora_weights="kaiming", pretrained_lora_path=None,
         state_dict_converter=None, quantize = None
@@ -62,10 +65,10 @@ class LightningModel(LightningModelForT2ILoRA):
 
         model_manager = ModelManager(torch_dtype=torch_dtype, device=self.device)
         if quantize is None:
-            model_manager.load_models(pretrained_weights)
+            model_manager.load_models(pretrained_weights, torch_dtype=torch_dtype)
         else:
-            model_manager.load_models(pretrained_weights[1:])
-            model_manager.load_model(pretrained_weights[0], torch_dtype=quantize)
+            model_manager.load_models(pretrained_weights[1:], torch_dtype=torch_dtype)
+            model_manager.load_model(pretrained_weights[0], torch_dtype=torch_dtype)
         if preset_lora_path is not None:
             preset_lora_path = preset_lora_path.split(",")
             for path in preset_lora_path:
@@ -294,6 +297,70 @@ def lets_dance_flux(
     return hidden_states,hidden_states_bbox
 
 
+        self.total_loss =0
+        self.step = 0
+
+    def on_after_backward(self):
+        total_norm = 0.0
+        for p in self.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        total_norm = total_norm ** 0.5
+
+        # Log it to Lightning's logger (e.g., TensorBoard)
+        self.log("train/grad_l2_norm", total_norm, on_step=True, on_epoch=False, prog_bar=True, logger=True)
+    
+    def training_step(self, batch, batch_idx):
+        # Data
+        self.step +=1
+        text, image = batch["text"], batch["image"]
+
+        entity_prompts = []
+        entity_masks = []
+        for i in range(len(batch["entity_mask"][0])):
+            prompts = []
+            masks = []
+            for j in range(len(batch["entity_mask"])):
+                prompts.append(batch["entity_prompt"][j][i])
+                masks.append(batch["entity_mask"][j][i])
+            entity_prompts.append(prompts)
+            entity_masks.append(masks)
+
+        height,width = 1024,1024
+
+        self.pipe.device = self.device
+        prompt_emb_posi, prompt_emb_nega, prompt_emb_locals = self.pipe.prepare_prompts(text, local_prompts=(), masks=(), mask_scales=(), t5_sequence_length=512, negative_prompt="", cfg_scale=1.0)
+        eligen_kwargs_posi, eligen_kwargs_nega, fg_mask, bg_mask = self.pipe.prepare_eligen(prompt_emb_nega, entity_prompts, entity_masks, width, height, 512, False, False, 1.0)
+
+        if "latents" in batch:
+            latents = batch["latents"].to(dtype=self.pipe.torch_dtype, device=self.device)
+        else:
+            latents = self.pipe.vae_encoder(image.to(dtype=self.pipe.torch_dtype, device=self.device))
+
+        noise = torch.randn_like(latents)
+        timestep_id = torch.randint(0, self.pipe.scheduler.num_train_timesteps, (1,))
+        timestep = self.pipe.scheduler.timesteps[timestep_id].to(self.device)
+        extra_input = self.pipe.prepare_extra_input(latents)
+        noisy_latents = self.pipe.scheduler.add_noise(latents, noise, timestep)
+        training_target = self.pipe.scheduler.training_target(latents, noise, timestep)
+
+        # Compute loss
+        noise_pred = self.pipe.denoising_model()(
+            hidden_states=noisy_latents, timestep=timestep, **prompt_emb_posi, **extra_input, **eligen_kwargs_posi,
+            use_gradient_checkpointing=self.use_gradient_checkpointing
+        )
+
+        loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
+        loss = loss * self.pipe.scheduler.training_weight(timestep)
+        self.total_loss += loss
+        
+        # Record log
+        self.log("train_loss", self.total_loss/self.step, prog_bar=True)
+        if (self.step+1)%1000==0:
+            self.step = 0
+            self.total_loss = 0
+        return loss
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
