@@ -1,4 +1,4 @@
-
+# -*- coding: utf-8 -*-
 from ..models import ModelManager, SD3TextEncoder1, SD3TextEncoder2, SD3TextEncoder3, SD3DiT, SD3VAEDecoder, SD3VAEEncoder
 from ..prompters import SD3Prompter
 from ..schedulers import FlowMatchScheduler
@@ -28,12 +28,48 @@ class SD3ImagePipeline(BasePipeline):
         self.vae_decoder: SD3VAEDecoder = None
         self.vae_encoder: SD3VAEEncoder = None
         self.model_names = ['text_encoder_1', 'text_encoder_2', 'text_encoder_3', 'dit', 'vae_decoder', 'vae_encoder']
-
-
+        
     def denoising_model(self):
         return self.dit
 
-
+    def load_specific_layers(self, target_layers=["proj_out", "bbox_embedder"]):
+        """
+        Load weights only for specific layers from a weights dictionary.
+        
+        Args:
+            model: The model to load weights into
+            weights_dict: Dictionary containing weights
+            target_layers: List of layer names to load weights for
+        
+        Returns:
+            model: The model with updated weights
+            loaded_keys: List of parameter keys that were loaded
+        """
+        weights_dict = torch.load("/data/shresth/DiffSynth-Studio/lightning_logs/version_26/checkpoints/epoch=42-step=43000.ckpt")
+        loaded_keys = []
+        model_state_dict = self.dit.state_dict()
+        
+        # Filter weights dictionary to only include keys for target layers
+        for key in model_state_dict.keys():
+            # Check if the key belongs to any of the target layers
+            if any(target_layer in key for target_layer in target_layers):
+                if key in weights_dict:
+                    # Get the target parameter
+                    param = model_state_dict[key]
+                    # Get the weight from the dictionary
+                    weight = weights_dict[key]
+                    
+                    # Match device and dtype before loading
+                    weight = weight.to(device=param.device, dtype=torch.float16)
+                    
+                    # Update the model's state dict
+                    model_state_dict[key] = weight
+                    loaded_keys.append(key)
+        # Load the filtered state dict back into the model
+        self.dit.load_state_dict(model_state_dict, strict=False)
+        
+        #print(f"Loaded {len(loaded_keys)} parameters for layers: {', '.join(target_layers)}")
+        
     def fetch_models(self, model_manager: ModelManager, prompt_refiner_classes=[]):
         self.text_encoder_1 = model_manager.fetch_model("sd3_text_encoder_1")
         self.text_encoder_2 = model_manager.fetch_model("sd3_text_encoder_2")
@@ -157,14 +193,15 @@ class SD3ImagePipeline(BasePipeline):
         tile_size=128,
         tile_stride=64,
         seed=None,
+        bboxes=None,
         progress_bar_cmd=tqdm,
         progress_bar_st=None,
     ):
         height, width = self.check_resize_height_width(height, width)
         # Tiler parameters
         tiler_kwargs = {"tiled": tiled, "tile_size": tile_size, "tile_stride": tile_stride}
-
-        # Prepare scheduler
+        bbox = torch.stack(bboxes).permute(1,0,2)
+        B, N, C = bbox.shape
         self.scheduler.set_timesteps(num_inference_steps, denoising_strength)
         #t5_sequence_length = 512
         # Prepare latent tensors
@@ -174,9 +211,13 @@ class SD3ImagePipeline(BasePipeline):
             latents = self.encode_image(image, **tiler_kwargs)
             noise = self.generate_noise((1, 16, height//8, width//8), seed=seed, device=self.device, dtype=self.torch_dtype)
             latents = self.scheduler.add_noise(latents, noise, timestep=self.scheduler.timesteps[0])
+            noise_2 = self.generate_noise(**bbox.shape, seed=seed, device=self.device, dtype=self.torch_dtype)
+            latents_2 = self.scheduler.add_noise(bbox, noise_2, timestep=self.scheduler.timesteps[0]) 
         else:
             latents = self.generate_noise((1, 16, height//8, width//8), seed=seed, device=self.device, dtype=self.torch_dtype)
-
+            noise_2 = self.generate_noise((B,N,C), seed=seed, device=self.device, dtype=self.torch_dtype)
+            latents_2 = self.scheduler.add_noise(bbox, noise_2, timestep=self.scheduler.timesteps[0])
+        print(latents_2.shape)
         # Encode prompts
         #t5_sequence_length = 77
         self.load_models_to_device(['text_encoder_1', 'text_encoder_2', 'text_encoder_3'])
@@ -201,20 +242,22 @@ class SD3ImagePipeline(BasePipeline):
             timestep = timestep.unsqueeze(0).to(self.device)
 
             # Classifier-free guidance
-            inference_callback = lambda prompt_emb_posi: lets_dance_sd3(
-                dit = self.dit,hidden_states = latents, timestep=timestep, **prompt_emb_posi, **eligen_kwargs_posi,**tiler_kwargs,
+            inference_callback = lambda prompt_emb_posi: lets_dance_sd3_bbox(
+                dit = self.dit,hidden_states = latents, timestep=timestep,bbox_latents=latents_2, **prompt_emb_posi, **eligen_kwargs_posi,**tiler_kwargs,
             )
-            noise_pred_posi = self.control_noise_via_local_prompts(prompt_emb_posi, prompt_emb_locals, masks, mask_scales, inference_callback)
+            noise_pred_posi,noise_pred_bbox = self.control_noise_via_local_prompts(prompt_emb_posi, prompt_emb_locals, masks, mask_scales, inference_callback)
             #print("NOISE CONTROL DONE")
             ### controlled denoising
             if cfg_scale != 1.0:
                 # Negative side
-                noise_pred_nega = lets_dance_sd3(
+                noise_pred_nega,noise_bbox = lets_dance_sd3_bbox(
                     dit=self.dit,
                     hidden_states=latents, timestep=timestep,
+                    bbox_latents=latents_2,
                     **prompt_emb_nega,  **eligen_kwargs_nega,
                 )
                 noise_pred = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
+                noise_pred_bbox = noise_bbox + cfg_scale * (noise_pred_bbox - noise_bbox)
             else:
                 noise_pred = noise_pred_posi
             
@@ -225,7 +268,7 @@ class SD3ImagePipeline(BasePipeline):
 
             # DDIM
             latents = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], latents)
-
+            latents_2 = self.scheduler.step(noise_pred_bbox, self.scheduler.timesteps[progress_id], latents_2)
             # UI
             if progress_bar_st is not None:
                 progress_bar_st.progress(progress_id / len(self.scheduler.timesteps))
@@ -233,10 +276,69 @@ class SD3ImagePipeline(BasePipeline):
         # Decode image
         self.load_models_to_device(['vae_decoder'])
         image = self.decode_image(latents, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
-
+        print(latents_2)
         # offload all models
         self.load_models_to_device([])
         return image
+
+def lets_dance_sd3_bbox(
+    dit,
+    hidden_states=None,
+    bbox_latents=None,
+    timestep=None,
+    prompt_emb=None,
+    pooled_prompt_emb=None,
+    guidance=None,
+    text_ids=None,
+    entity_prompt_emb=None,
+    entity_masks=None,
+    **kwargs
+):
+    
+    conditioning = dit.time_embedder(timestep, hidden_states.dtype) + dit.pooled_text_embedder(pooled_prompt_emb)
+    #bbox_latents.to(dtype = torch.float16)
+    #print(bbox_latents.dtype)
+    bbox_embeddings = dit.bbox_embedder(bbox_latents)
+    bbox_embeddings.to(hidden_states.dtype)
+    #prompt_emb = dit.context_embedder(prompt_emb)
+    height, width = hidden_states.shape[-2:]
+    #print(hidden_states)
+    #print(bbox_embeddings.shape)
+    attention_mask=None
+    hidden_states = dit.pos_embedder(hidden_states)
+    if  entity_prompt_emb is not None and entity_masks is not None:
+        prompt_emb, image_rotary_emb, attention_mask = dit.process_entity_masks(hidden_states, prompt_emb, entity_prompt_emb, entity_masks, text_ids,bbox_embeddings)
+        binary_mask = torch.where(attention_mask.squeeze(0).squeeze(0) == 0, 1, 0).cpu().numpy().astype(np.uint8) * 255
+    
+        # Convert to image
+        img = Image.fromarray(binary_mask)
+    
+        # Save as PNG image
+        #img.save("attn.png")
+
+    else:
+        prompt_emb = dit.context_embedder(prompt_emb)
+        image_rotary_emb = None#dit.pos_embedder(torch.cat((text_ids), dim=1))
+        attention_mask = None
+   #print(hidden_states)
+    def create_custom_forward(module):
+        def custom_forward(*inputs):
+            return module(*inputs)
+        return custom_forward
+    bbox_embeddings = bbox_embeddings
+    num_bbox = bbox_embeddings.shape[1]
+    hidden_states = torch.cat([bbox_embeddings,hidden_states], dim=1)
+    for block in dit.blocks:
+        hidden_states, prompt_emb = block(hidden_states, prompt_emb, conditioning,attention_mask)
+    
+    hidden_states = dit.norm_out(hidden_states, conditioning)
+    bbox_states,hidden_states =  hidden_states[:,:num_bbox,:], hidden_states[:,num_bbox:,:]
+    hidden_states = dit.proj_out(hidden_states)
+    bbox_out= dit.proj_out_bbox(bbox_states)
+
+    
+    hidden_states = rearrange(hidden_states, "B (H W) (P Q C) -> B C (H P) (W Q)", P=2, Q=2, H=height//2, W=width//2)
+    return hidden_states, bbox_out
 
 
 def lets_dance_sd3(
@@ -254,7 +356,7 @@ def lets_dance_sd3(
     
     conditioning = dit.time_embedder(timestep, hidden_states.dtype) + dit.pooled_text_embedder(pooled_prompt_emb)
     #prompt_emb = dit.context_embedder(prompt_emb)
-
+    #print(hidden_states.shape)
     height, width = hidden_states.shape[-2:]
     hidden_states = dit.pos_embedder(hidden_states)
     #print(entity_prompt_emb)
@@ -280,11 +382,13 @@ def lets_dance_sd3(
         def custom_forward(*inputs):
             return module(*inputs)
         return custom_forward
-    
+    cnt=0
     for block in dit.blocks:
+        
         #print("1",block)
-       hidden_states, prompt_emb = block(hidden_states, prompt_emb, conditioning,mask=attention_mask)
-    
+        print(hidden_states.shape,prompt_emb.shape,conditioning.shape,"#########",cnt)
+        hidden_states, prompt_emb = block(hidden_states, prompt_emb, conditioning,mask=attention_mask)
+        cnt+=1
     hidden_states = dit.norm_out(hidden_states, conditioning)
     hidden_states = dit.proj_out(hidden_states)
     hidden_states = rearrange(hidden_states, "B (H W) (P Q C) -> B C (H P) (W Q)", P=2, Q=2, H=height//2, W=width//2)
@@ -437,4 +541,4 @@ class SD3ImagePipeline(BasePipeline):
         # offload all models
         self.load_models_to_device([])
         return image
-    """
+"""    

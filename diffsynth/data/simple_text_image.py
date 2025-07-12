@@ -68,23 +68,25 @@ class TextImageDataset(torch.utils.data.Dataset):
         entity_prompts = []
         masks = []
         shape = [round(height*scale),round(width*scale)]
-
+        bboxes = []
         for entity in entities:
             entity_prompts.append(entity["entity"])
             bbox = entity['bbox']
             mask = np.zeros((target_height,target_width,3))
             mask[int(bbox[1]*target_height):int(bbox[3]*target_height),int(bbox[0]*target_width):int(bbox[2]*target_width),:] = 255.0
             masks.append(mask)
+            bboxes.append(np.array(bbox))
         remaining  = max(0, 10-len(masks))
         for i in range(remaining):
             masks.append(np.zeros((target_height,target_width,3)))
             entity_prompts.append("")
         
-
+        if len(bboxes) > 10:
+            bboxes = bboxes[:10]
         
         image = torchvision.transforms.functional.resize(image,shape,interpolation=transforms.InterpolationMode.BILINEAR)
         image = self.image_processor(image)
-        return {"text": text, "image": image,"entity_mask":masks[:10],"entity_prompt":entity_prompts[:10]}
+        return {"text": text, "image": image,"entity_mask":masks[:10],"entity_prompt":entity_prompts[:10],"bboxes":bboxes}
 
 
     def __len__(self):

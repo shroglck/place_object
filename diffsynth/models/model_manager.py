@@ -56,6 +56,7 @@ from .utils import load_state_dict, init_weights_on_device, hash_state_dict_keys
 def load_model_from_single_file(state_dict, model_names, model_classes, model_resource, torch_dtype, device):
     loaded_model_names, loaded_models = [], []
     for model_name, model_class in zip(model_names, model_classes):
+    
         print(f"    model_name: {model_name} model_class: {model_class.__name__}")
         state_dict_converter = model_class.state_dict_converter()
         if model_resource == "civitai":
@@ -72,7 +73,10 @@ def load_model_from_single_file(state_dict, model_names, model_classes, model_re
             model = model_class(**extra_kwargs)
         if hasattr(model, "eval"):
             model = model.eval()
-        model.load_state_dict(model_state_dict, assign=True)
+        model = model.to_empty(device=device)
+        model.load_state_dict(model_state_dict, assign=True, strict=False)
+
+        #model.load_state_dict(model_state_dict, assign=True)
         model = model.to(dtype=torch_dtype, device=device)
         loaded_model_names.append(model_name)
         loaded_models.append(model)

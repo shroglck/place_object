@@ -8,6 +8,8 @@ import torch
 from tqdm import tqdm
 import numpy as np
 from PIL import Image
+import torch.nn.functional as F
+
 from ..models.tiler import FastTileWorker
 from transformers import SiglipVisionModel
 from copy import deepcopy
@@ -15,6 +17,65 @@ from transformers.models.t5.modeling_t5 import T5LayerNorm, T5DenseActDense, T5D
 from ..models.flux_dit import RMSNorm
 from ..vram_management import enable_vram_management, AutoWrappedModule, AutoWrappedLinear
 import torch.nn.functional as F
+
+def calculate_iou(boxes1, boxes2):
+    """
+    Calculate IoU between corresponding bounding boxes in two tensors.
+    
+    Args:
+        boxes1 (torch.Tensor): Ground truth boxes with shape [n, 4], format [x1, y1, x2, y2]
+        boxes2 (torch.Tensor): Predicted boxes with shape [n, 4], format [x1, y1, x2, y2]
+        
+    Returns:
+        torch.Tensor: IoU values for each pair of boxes with shape [n]
+    """
+    # Ensure inputs are tensors with the same first dimension
+    assert boxes1.shape[0] == boxes2.shape[0], f"Expected same number of boxes, got {boxes1.shape[0]} and {boxes2.shape[0]}"
+    assert boxes1.shape[1] == 4 and boxes2.shape[1] == 4, f"Expected boxes with 4 coordinates, got shapes {boxes1.shape} and {boxes2.shape}"
+    
+    # Calculate areas for all boxes in one go
+    area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])  # [n]
+    area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])  # [n]
+    
+    # Calculate intersection coordinates
+    x1 = torch.max(boxes1[:, 0], boxes2[:, 0])  # [n]
+    y1 = torch.max(boxes1[:, 1], boxes2[:, 1])  # [n]
+    x2 = torch.min(boxes1[:, 2], boxes2[:, 2])  # [n]
+    y2 = torch.min(boxes1[:, 3], boxes2[:, 3])  # [n]
+    
+    # Calculate intersection areas, handling non-overlapping cases
+    w = torch.clamp(x2 - x1, min=0)  # [n]
+    h = torch.clamp(y2 - y1, min=0)  # [n]
+    intersection = w * h  # [n]
+    
+    # Calculate union areas
+    union = area1 + area2 - intersection  # [n]
+    
+    # Calculate IoU
+    iou = intersection / union  # [n]
+    
+    return iou
+
+
+
+def calculate_batch_iou(gt_boxes, pred_boxes):
+    """
+    Calculate IoU for multiple pairs of ground truth and predicted bounding boxes.
+    
+    Args:
+        gt_boxes (list): List of ground truth boxes, each in format [x1, y1, x2, y2]
+        pred_boxes (list): List of predicted boxes, each in format [x1, y1, x2, y2]
+    
+    Returns:
+        list: List of IoU values for each pair of boxes
+    """
+    assert len(gt_boxes) == len(pred_boxes), "Number of ground truth and predicted boxes must be the same"
+    
+    iou_values = []
+    for gt_box, pred_box in zip(gt_boxes, pred_boxes):
+        iou_values.append(calculate_iou(gt_box, pred_box))
+    
+    return iou_values
 
 
 class FluxImagePipeline(BasePipeline):
@@ -137,7 +198,64 @@ class FluxImagePipeline(BasePipeline):
     def denoising_model(self):
         return self.dit
 
-
+    def load_specific_layers(self, target_layers=["final_bbox_out", "bbox_embedder", "_c","c_"],path="",train=False):
+        """
+        Load weights only for specific layers from a weights dictionary.
+        
+        Args:
+            model: The model to load weights into
+            weights_dict: Dictionary containing weights
+            target_layers: List of layer names or patterns to load weights for
+        
+        Returns:
+            model: The model with updated weightsImag
+            loaded_keys: List of parameter keys that were loaded
+        """
+        print("loading from",path)
+        weights_dict = torch.load(path)
+        loaded_keys = []
+        d = self.device
+        self.dit = self.dit.cpu()
+        model_state_dict = self.dit.state_dict()
+        #print(model_state_dict.keys())
+        cnt = 0
+        for cn in weights_dict.keys():
+            if "_c" in cn:
+                cnt+=1
+        for key in weights_dict.keys():
+            # Check if the key contains any of the target layer patterns
+            if any(target_layer in key for target_layer in target_layers):
+                if key in model_state_dict:
+                    # Get the target parameter
+                    param = model_state_dict[key]
+                    # Get the weight from the dictionary
+                    weight = weights_dict[key]
+                    
+                    # Match device and dtype before loading
+                    weight = weight.to(device=param.device, dtype=param.dtype)
+                    
+                    # Update the model's state dict
+                    model_state_dict[key] = weight
+                    loaded_keys.append(key)
+        
+        print(f"Total of {len(loaded_keys)} keys loaded",loaded_keys)
+        print("First few loaded keys:", loaded_keys[:5] if len(loaded_keys) > 5 else loaded_keys)
+        
+        # Load the filtered state dict back into the model
+        self.dit.load_state_dict(model_state_dict, strict=False)
+        del weights_dict
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        # Move model back to target device
+        self.dit = self.dit.to(d)
+        
+        # Final cache clear
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        self.dit = self.dit.to(d)
+        return loaded_keys
+    
     def fetch_models(self, model_manager: ModelManager, controlnet_config_units: List[ControlNetConfigUnit]=[], prompt_refiner_classes=[], prompt_extender_classes=[]):
         self.text_encoder_1 = model_manager.fetch_model("sd3_text_encoder_1")
         self.text_encoder_2 = model_manager.fetch_model("flux_text_encoder_2")
@@ -258,28 +376,25 @@ class FluxImagePipeline(BasePipeline):
         return inpaint_noise
 
 
-    def preprocess_masks(self, masks, height, width, dim,test = False):
+    def preprocess_masks(self, masks, height, width, dim,train=True):
         out_masks = []
         
         for mask in masks:
-            if test:
+            if not train:
                 mask = self.preprocess_image(mask.resize((width, height), resample=Image.NEAREST)).mean(dim=1, keepdim=True) > 0
-                mask = mask.repeat(1, dim, 1, 1).to(device=self.device, dtype=self.torch_dtype)
             else:
-                temp_masks = []
-                for temp_mask in mask:
-                    temp_mask = Image.fromarray(temp_mask.to(torch.uint8).cpu().numpy())
-                    temp_mask = self.preprocess_image(temp_mask.resize((width, height), resample=Image.NEAREST)).mean(dim=1, keepdim=True) > 0
-                    temp_mask = temp_mask.repeat(1, dim, 1, 1).to(device=self.device, dtype=self.torch_dtype)
-                    temp_masks.append(temp_mask)
-
-                mask = torch.cat(temp_masks, dim=0).unsqueeze(0) 
+                mask = F.interpolate(mask.unsqueeze(0), size=(height, width,3), mode='nearest').squeeze(0).squeeze(0)
+                d = mask.device
+                mask = np.array(mask.cpu())
+                
+                mask = self.preprocess_image(mask).mean(dim=1, keepdim=True) > 0
             
+            mask = mask.repeat(1, dim, 1, 1).to(device=self.device, dtype=self.torch_dtype)
             out_masks.append(mask)
         return out_masks
 
 
-    def prepare_entity_inputs(self, entity_prompts, entity_masks, width, height, t5_sequence_length=512, enable_eligen_inpaint=False, test=False):
+    def prepare_entity_inputs(self, entity_prompts, entity_masks, width, height, t5_sequence_length=512, enable_eligen_inpaint=False,train=False):
         fg_mask, bg_mask = None, None
         if enable_eligen_inpaint:
             masks_ = deepcopy(entity_masks)
@@ -287,33 +402,27 @@ class FluxImagePipeline(BasePipeline):
             fg_masks = (fg_masks > 0).float()
             fg_mask = fg_masks.sum(dim=0, keepdim=True).repeat(1, 16, 1, 1) > 0
             bg_mask = ~fg_mask
-        entity_masks = self.preprocess_masks(entity_masks, height//8, width//8, 1, test=test)
-        entity_masks = torch.cat(entity_masks, dim=0) # b, n_mask, c, h, w
-        if test:
-            entity_masks = entity_masks.unsqueeze(0)
-        # entity_prompts = self.encode_prompt(entity_prompts, t5_sequence_length=t5_sequence_length)['prompt_emb'].unsqueeze(0)
-        entity_p = []
-        for i in range(len(entity_prompts)):
-            prompts = entity_prompts[i]
-            prompts = self.encode_prompt(prompts, t5_sequence_length)['prompt_emb'].unsqueeze(0)
-            entity_p.append(prompts)
-
-        entity_prompts = torch.cat(entity_p, dim=0)
-        # entity_prompts = torch.cat([self.encode_prompt(tt, t5_sequence_length)['prompt_emb'].unsqueeze(0) for tt in entity_prompts],dim=1)
+        entity_masks = self.preprocess_masks(entity_masks, height//8, width//8, 1,train=train)
+        entity_masks = torch.cat(entity_masks, dim=0).unsqueeze(0) # b, n_mask, c, h, w
+        entity_prompts = self.encode_prompt(entity_prompts, t5_sequence_length=t5_sequence_length)['prompt_emb'].unsqueeze(0)
         return entity_prompts, entity_masks, fg_mask, bg_mask
 
 
-    def prepare_latents(self, input_image, height, width, seed, tiled, tile_size, tile_stride):
+    def prepare_latents(self, input_image, height, width, seed,tiled, tile_size, tile_stride,bbox= None):
         if input_image is not None:
             self.load_models_to_device(['vae_encoder'])
             image = self.preprocess_image(input_image).to(device=self.device, dtype=self.torch_dtype)
             input_latents = self.encode_image(image, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
             noise = self.generate_noise((1, 16, height//8, width//8), seed=seed, device=self.device, dtype=self.torch_dtype)
             latents = self.scheduler.add_noise(input_latents, noise, timestep=self.scheduler.timesteps[0])
+            noise_bbox = self.generate_noise((1,bbox.shape[1],4), seed=seed, device=self.device, dtype=self.torch_dtype)
+            bbox_latents = self.scheduler.add_noise(bbox, noise_bbox, timestep=self.scheduler.timesteps[0])
         else:
             latents = self.generate_noise((1, 16, height//8, width//8), seed=seed, device=self.device, dtype=self.torch_dtype)
+            noise_bbox = self.generate_noise((1,bbox.shape[1],4), seed=seed, device=self.device, dtype=self.torch_dtype)
+            bbox_latents = self.scheduler.add_noise(bbox, noise_bbox, timestep=self.scheduler.timesteps[0])
             input_latents = None
-        return latents, input_latents
+        return latents, input_latents,bbox_latents
 
 
     def prepare_ipadapter(self, ipadapter_images, ipadapter_scale):
@@ -344,11 +453,11 @@ class FluxImagePipeline(BasePipeline):
         return controlnet_kwargs_posi, controlnet_kwargs_nega, local_controlnet_kwargs
 
 
-    def prepare_eligen(self, prompt_emb_nega, eligen_entity_prompts, eligen_entity_masks, width, height, t5_sequence_length, enable_eligen_inpaint, enable_eligen_on_negative, cfg_scale, test=False):
-        # print("$$$$$$$$$$$$$$$$$$$$$$$$$$$",enable_eligen_on_negative)
+    def prepare_eligen(self, prompt_emb_nega, eligen_entity_prompts, eligen_entity_masks, width, height, t5_sequence_length, enable_eligen_inpaint, enable_eligen_on_negative, cfg_scale,train):
+        #print("$$$$$$$$$$$$$$$$$$$$$$$$$$$",enable_eligen_on_negative)
 
         if eligen_entity_masks is not None:
-            entity_prompt_emb_posi, entity_masks_posi, fg_mask, bg_mask = self.prepare_entity_inputs(eligen_entity_prompts, eligen_entity_masks, width, height, t5_sequence_length, enable_eligen_inpaint, test=test)
+            entity_prompt_emb_posi, entity_masks_posi, fg_mask, bg_mask = self.prepare_entity_inputs(eligen_entity_prompts, eligen_entity_masks, width, height, t5_sequence_length, enable_eligen_inpaint,train)
             if enable_eligen_on_negative and cfg_scale != 1.0:
                 entity_prompt_emb_nega = prompt_emb_nega['prompt_emb'].unsqueeze(1).repeat(1, entity_masks_posi.shape[1], 1, 1)
                 entity_masks_nega = entity_masks_posi
@@ -407,6 +516,7 @@ class FluxImagePipeline(BasePipeline):
         eligen_entity_masks=None,
         enable_eligen_on_negative=False,
         enable_eligen_inpaint=False,
+        bbox = None,
         # TeaCache
         tea_cache_l1_thresh=None,
         # Tile
@@ -418,6 +528,8 @@ class FluxImagePipeline(BasePipeline):
         progress_bar_st=None,
     ):
         height, width = self.check_resize_height_width(height, width)
+        bbox = 2*(torch.stack(bbox).permute(1,0,2)-0.5)
+
 
         # Tiler parameters
         tiler_kwargs = {"tiled": tiled, "tile_size": tile_size, "tile_stride": tile_stride}
@@ -426,7 +538,7 @@ class FluxImagePipeline(BasePipeline):
         self.scheduler.set_timesteps(num_inference_steps, denoising_strength)
 
         # Prepare latent tensors
-        latents, input_latents = self.prepare_latents(input_image, height, width, seed, tiled, tile_size, tile_stride)
+        latents, input_latents,bbox_latents = self.prepare_latents(input_image, height, width, seed, tiled, tile_size, tile_stride,bbox=bbox)
 
         # Prompt
         prompt_emb_posi, prompt_emb_nega, prompt_emb_locals = self.prepare_prompts(prompt, local_prompts, masks, mask_scales, t5_sequence_length, negative_prompt, cfg_scale)
@@ -435,7 +547,7 @@ class FluxImagePipeline(BasePipeline):
         extra_input = self.prepare_extra_input(latents, guidance=embedded_guidance)
 
         # Entity control
-        eligen_kwargs_posi, eligen_kwargs_nega, fg_mask, bg_mask = self.prepare_eligen(prompt_emb_nega, eligen_entity_prompts, eligen_entity_masks, width, height, t5_sequence_length, enable_eligen_inpaint, enable_eligen_on_negative, cfg_scale, test=True)
+        eligen_kwargs_posi, eligen_kwargs_nega, fg_mask, bg_mask = self.prepare_eligen(prompt_emb_nega, eligen_entity_prompts, eligen_entity_masks, width, height, t5_sequence_length, enable_eligen_inpaint, enable_eligen_on_negative, cfg_scale,train=False)
         # IP-Adapter
         ipadapter_kwargs_list_posi, ipadapter_kwargs_list_nega = self.prepare_ipadapter(ipadapter_images, ipadapter_scale)
 
@@ -453,13 +565,18 @@ class FluxImagePipeline(BasePipeline):
             # Positive side
             inference_callback = lambda prompt_emb_posi, controlnet_kwargs: lets_dance_flux(
                 dit=self.dit, controlnet=self.controlnet,
-                hidden_states=latents, timestep=timestep,
+                hidden_states=latents, timestep=timestep,bbox_emb=bbox_latents,
                 **prompt_emb_posi, **tiler_kwargs, **extra_input, **controlnet_kwargs, **ipadapter_kwargs_list_posi, **eligen_kwargs_posi, **tea_cache_kwargs,
             )
-            noise_pred_posi = self.control_noise_via_local_prompts(
-                prompt_emb_posi, prompt_emb_locals, masks, mask_scales, inference_callback,
-                special_kwargs=controlnet_kwargs_posi, special_local_kwargs_list=local_controlnet_kwargs
-            )
+            noise_pred_posi,noise_pred_posi_bbox = lets_dance_flux(dit=self.dit, controlnet=self.controlnet,
+                    hidden_states=latents, timestep=timestep,bbox_emb=bbox_latents,
+                    **prompt_emb_posi, **tiler_kwargs, **extra_input, **controlnet_kwargs_posi, **ipadapter_kwargs_list_posi, **eligen_kwargs_posi,
+                )
+            
+            #self.control_noise_via_local_prompts(
+                #prompt_emb_posi, prompt_emb_locals, masks, mask_scales, inference_callback,
+                #special_kwargs=controlnet_kwargs_posi, special_local_kwargs_list=local_controlnet_kwargs
+            #)
 
             # Inpaint
             if enable_eligen_inpaint:
@@ -468,26 +585,30 @@ class FluxImagePipeline(BasePipeline):
             # Classifier-free guidance
             if cfg_scale != 1.0:
                 # Negative side
-                noise_pred_nega = lets_dance_flux(
+                noise_pred_nega,noise_pred_nega_bbox = lets_dance_flux(
                     dit=self.dit, controlnet=self.controlnet,
-                    hidden_states=latents, timestep=timestep,
+                    hidden_states=latents, timestep=timestep,bbox_emb=bbox_latents,
                     **prompt_emb_nega, **tiler_kwargs, **extra_input, **controlnet_kwargs_nega, **ipadapter_kwargs_list_nega, **eligen_kwargs_nega,
                 )
                 noise_pred = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
+                noise_pred_bbox = noise_pred_nega_bbox + cfg_scale * (noise_pred_posi_bbox - noise_pred_nega_bbox)
             else:
                 noise_pred = noise_pred_posi
 
+            #noise_pred_bbox = noise_pred_posi_bbox
             # Iterate
             latents = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], latents)
-
+            bbox_latents = self.scheduler.step(noise_pred_bbox, self.scheduler.timesteps[progress_id], bbox_latents)
             # UI
             if progress_bar_st is not None:
                 progress_bar_st.progress(progress_id / len(self.scheduler.timesteps))
         
         # Decode image
+        
         self.load_models_to_device(['vae_decoder'])
         image = self.decode_image(latents, **tiler_kwargs)
 
+        print(calculate_iou(bbox.squeeze(0)/2+0.5,bbox_latents.squeeze(0)/2+0.5),(bbox_latents/2)+0.5, bbox.squeeze(0)/2+0.5)
         # Offload all models
         self.load_models_to_device([])
         return image
@@ -546,6 +667,7 @@ def lets_dance_flux(
     guidance=None,
     text_ids=None,
     image_ids=None,
+    bbox_emb=None, 
     controlnet_frames=None,
     tiled=False,
     tile_size=128,
@@ -556,6 +678,9 @@ def lets_dance_flux(
     tea_cache: TeaCache = None,
     **kwargs
 ):
+    bbox_emb = dit.bbox_embedder(bbox_emb.to(hidden_states.dtype)) 
+    bbox_ids = torch.arange(bbox_emb.shape[1],device=hidden_states.device).unsqueeze(0).unsqueeze(-1).repeat(1,1,3)
+    
     if tiled:
         def flux_forward_fn(hl, hr, wl, wr):
             tiled_controlnet_frames = [f[:, :, hl: hr, wl: wr] for f in controlnet_frames] if controlnet_frames is not None else None
@@ -600,11 +725,11 @@ def lets_dance_flux(
         controlnet_res_stack, controlnet_single_res_stack = controlnet(
             controlnet_frames, **controlnet_extra_kwargs
         )
-
     if image_ids is None:
         image_ids = dit.prepare_image_ids(hidden_states)
     
     conditioning = dit.time_embedder(timestep, hidden_states.dtype) + dit.pooled_text_embedder(pooled_prompt_emb)
+    bbox_temb = dit.bbox_temb(conditioning).to(conditioning.dtype)
     if dit.guidance_embedder is not None:
         guidance = guidance * 1000
         conditioning = conditioning + dit.guidance_embedder(guidance, hidden_states.dtype)
@@ -613,9 +738,8 @@ def lets_dance_flux(
     hidden_states = dit.patchify(hidden_states)
     hidden_states = dit.x_embedder(hidden_states)
     #print(hidden_states.shape,prompt_emb.shape,entity_prompt_emb.shape)
-
     if entity_prompt_emb is not None and entity_masks is not None:
-        prompt_emb, image_rotary_emb, attention_mask = dit.process_entity_masks(hidden_states, prompt_emb, entity_prompt_emb, entity_masks, text_ids, image_ids)
+        prompt_emb, image_rotary_emb, attention_mask = dit.process_entity_masks(hidden_states, prompt_emb, entity_prompt_emb, entity_masks, text_ids, image_ids,bbox_ids=bbox_ids)
         binary_mask = torch.where(attention_mask.squeeze(0).squeeze(0) == 0, 1, 0).cpu().numpy().astype(np.uint8) * 255
     
         # Convert to image
@@ -626,8 +750,9 @@ def lets_dance_flux(
 
     else:
         prompt_emb = dit.context_embedder(prompt_emb)
-        image_rotary_emb = dit.pos_embedder(torch.cat((text_ids, image_ids), dim=1))
+        image_rotary_emb = dit.pos_embedder(torch.cat((text_ids, image_ids,bbox_ids), dim=1))
         attention_mask = None
+    #hidden_states = torch.cat([hidden_states, bbox_emb], dim=1)
     # TeaCache
     if tea_cache is not None:
         tea_cache_update = tea_cache.check(dit, hidden_states, conditioning)
@@ -641,13 +766,15 @@ def lets_dance_flux(
         # Joint Blocks
         for block_id, block in enumerate(dit.blocks):
             #print(hidden_states.shape)
-            hidden_states, prompt_emb = block(
-                hidden_states,
-                prompt_emb,
-                conditioning,
-                image_rotary_emb,
+            hidden_states, prompt_emb,bbox_emb = block(
+                hidden_states.to(torch.bfloat16),
+                prompt_emb.to(torch.bfloat16),
+                bbox_emb.to(torch.bfloat16),
+                conditioning.to(torch.bfloat16),
+                bbox_temb.to(torch.bfloat16),
+                image_rotary_emb.to(torch.bfloat16),
                 attention_mask,
-                ipadapter_kwargs_list=ipadapter_kwargs_list.get(block_id, None)
+                #ipadapter_kwargs_list=ipadapter_kwargs_list.get(block_id, None)
             )
             # Contr
             # olNet
@@ -656,6 +783,10 @@ def lets_dance_flux(
 
         # Single Blocks
         hidden_states = torch.cat([prompt_emb, hidden_states], dim=1)
+        if attention_mask is not None:
+            attention_mask = attention_mask[:,:, :hidden_states.shape[1], :hidden_states.shape[1]]
+        image_rotary_emb = image_rotary_emb[:,:, :hidden_states.shape[1]]
+    
         num_joint_blocks = len(dit.blocks)
         for block_id, block in enumerate(dit.single_blocks):
             hidden_states, prompt_emb = block(
@@ -675,7 +806,11 @@ def lets_dance_flux(
             tea_cache.store(hidden_states)
 
     hidden_states = dit.final_norm_out(hidden_states, conditioning)
+    #hidden_states_image = hidden_states[:, :-bbox_emb.shape[1]]
+    #hidden_states_bbox = hidden_states[:, -bbox_emb.shape[1]:]
     hidden_states = dit.final_proj_out(hidden_states)
+    hidden_states_bbox = dit.final_bbox_out(bbox_emb)
+    
     hidden_states = dit.unpatchify(hidden_states, height, width)
 
-    return hidden_states
+    return hidden_states,hidden_states_bbox

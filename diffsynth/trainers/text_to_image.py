@@ -4,12 +4,9 @@ import torch, os
 from ..data.simple_text_image import TextImageDataset
 from modelscope.hub.api import HubApi
 from ..models.utils import load_state_dict
-from lightning.pytorch.strategies import FSDPStrategy
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-from torch.distributed.fsdp import MixedPrecision
-from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
-from torch.distributed.fsdp import CPUOffload
-from PIL import Image
+from torch.nn import init
+from prodigyopt import Prodigy
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 class LightningModelForT2ILoRA(pl.LightningModule):
     def __init__(
@@ -51,11 +48,48 @@ class LightningModelForT2ILoRA(pl.LightningModule):
             target_modules=lora_target_modules.split(","),
         )
         model = inject_adapter_in_model(lora_config, model)
-        for param in model.parameters():
-            # Upcast LoRA parameters into fp32
-            if param.requires_grad:
-                param.data = param.to(torch.bfloat16)
+        #print(model)
+        try:
+            # Counter for stats
+            trainable_count = 0
+            total_count = 0
+            
+            # Then unfreeze and initialize parameters with the pattern in their name
+            patterns = ["bbox","_c","lora","c_"]
+            for name, param in model.named_parameters():
+                total_count += 1
+                for pattern in patterns:
+                    if pattern in name:
+                        
+                        param.requires_grad = True
+                        trainable_count += 1
+                        
+                        # Initialize the parameter if requested
+                        if True:
+                            if len(param.shape) > 1:
+                                # For weight matrices
+                                init.xavier_normal_(param)
+                            else:
+                                # For bias vectors
+                                init.zeros_(param)
+                    #else:
+                        #param.requires_grad = False
 
+            for param in model.bbox_embedder.parameters():
+                param.requires_grad = True
+
+            for param in model.final_bbox_out.parameters():
+                param.requires_grad = True
+
+            for param in model.parameters():
+                # Upcast LoRA parameters into fp32
+                if param.requires_grad:
+                    #print(param)
+                    param.data = param.to(torch.float32)
+            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            print(f"Total trainable parameters: {trainable_params}")
+        except Exception as e:
+            print()
         # Lora pretrained lora weights
         if pretrained_lora_path is not None:
             state_dict = load_state_dict(pretrained_lora_path)
@@ -99,12 +133,79 @@ class LightningModelForT2ILoRA(pl.LightningModule):
         return loss
 
 
-    def configure_optimizers(self):
+    """def configure_optimizers(self):
         trainable_modules = filter(lambda p: p.requires_grad, self.pipe.denoising_model().parameters())
-        optimizer = torch.optim.AdamW(trainable_modules, lr=self.learning_rate)
-        return optimizer
-    
-
+        
+        optimizer = Prodigy(trainable_modules, lr=self.learning_rate,safeguard_warmup=True,use_bias_correction=True,weight_decay=0.01,d0=1e-6)#torch.optim.AdamW(trainable_modules, lr=self.learning_rate)
+        
+        # Total number of steps
+        total_steps = 20000#self.n_epochs * self.steps_per_epoch
+        
+        scheduler = CosineAnnealingLR(optimizer, T_max=total_steps)
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {
+                'scheduler': scheduler,
+                'interval': 'step',  # Update the LR every step (not epoch)
+                'frequency': 1,
+            }}    
+    """
+    def configure_optimizers(self):
+        # Separate LoRA and non-LoRA parameters
+        lora_params = []
+        non_lora_params = []
+        
+        for name, param in self.pipe.denoising_model().named_parameters():
+            if param.requires_grad:
+                # Check if parameter name contains 'lora' (adjust this condition based on your naming convention)
+                if 'lora' in name.lower():
+                    lora_params.append(param)
+                else:
+                    non_lora_params.append(param)
+        
+        optimizers = []
+        schedulers = []
+        
+        # Non-LoRA parameters with Prodigy optimizer and scheduler
+        if non_lora_params:
+            non_lora_optimizer = Prodigy(
+                non_lora_params, 
+                lr=self.learning_rate,
+                safeguard_warmup=True,
+                use_bias_correction=True,
+                weight_decay=0.01,
+                d0=1e-6
+            )
+            optimizers.append(non_lora_optimizer)
+            
+            # Total number of steps
+            total_steps = 20000
+            scheduler = CosineAnnealingLR(non_lora_optimizer, T_max=total_steps)
+            schedulers.append({
+                'scheduler': scheduler,
+                'interval': 'step',
+                'frequency': 1,
+            })
+        
+        # LoRA parameters with constant learning rate (using separate AdamW)
+        if lora_params:
+            lora_optimizer = Prodigy(non_lora_params, lr=self.learning_rate,safeguard_warmup=True,use_bias_correction=True,weight_decay=0.01,d0=1e-6)
+            optimizers.append(lora_optimizer)
+            
+            # Return only optimizers and schedulers that exist
+            # Don't add None schedulers when using multiple optimizers
+        
+        # Return format for multiple optimizers
+        if len(optimizers) == 1:
+            return optimizers[0], schedulers[0] if schedulers else None
+        else:
+            # For multiple optimizers, only return schedulers that are not None
+            valid_schedulers = []
+            for i, opt in enumerate(optimizers):
+                if i < len(schedulers):
+                    valid_schedulers.append(schedulers[i])
+            
+            return optimizers, valid_schedulers
     def on_save_checkpoint(self, checkpoint):
         checkpoint.clear()
         trainable_param_names = list(filter(lambda named_param: named_param[1].requires_grad, self.pipe.denoising_model().named_parameters()))
@@ -119,14 +220,6 @@ class LightningModelForT2ILoRA(pl.LightningModule):
         checkpoint.update(lora_state_dict)
 
 
-class GradientLoggingCallback(pl.Callback):
-    def on_after_backward(self, trainer, pl_module):
-        for name, param in pl_module.named_parameters():
-            if param.grad is not None:
-                norm = param.grad.norm(2).item()
-                trainer.logger.experiment.add_scalar(f"grad_norm/{name}", norm, trainer.global_step)
-
-trainer = pl.Trainer(callbacks=[GradientLoggingCallback()])
 
 def add_general_parsers(parser):
     parser.add_argument(
@@ -316,10 +409,10 @@ def launch_training_task(model, args):
         precision=args.precision,
         default_root_dir=args.output_path,
         accumulate_grad_batches=args.accumulate_grad_batches,
-        log_every_n_steps=1,
-        callbacks=[pl.pytorch.callbacks.ModelCheckpoint(every_n_train_steps=100, save_top_k=-1)],
+        log_every_n_steps=10,
+        callbacks=[pl.pytorch.callbacks.ModelCheckpoint(save_top_k=-1)],
         logger=logger,
-        #gradient_clip_val=1, gradient_clip_algorithm="value"
+        #gradient_clip_val=1.0, gradient_clip_algorithm="norm"
     )
     trainer.fit(model=model, train_dataloaders=train_loader)
 

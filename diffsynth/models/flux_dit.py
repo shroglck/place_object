@@ -4,12 +4,113 @@ from einops import rearrange
 from .tiler import TileWorker
 from .utils import init_weights_on_device
 
+import torch.nn as nn
+import numpy as np
+
+
 def interact_with_ipadapter(hidden_states, q, ip_k, ip_v, scale=1.0):
     batch_size, num_tokens = hidden_states.shape[0:2]
     ip_hidden_states = torch.nn.functional.scaled_dot_product_attention(q, ip_k, ip_v)
     ip_hidden_states = ip_hidden_states.transpose(1, 2).reshape(batch_size, num_tokens, -1)
     hidden_states = hidden_states + scale * ip_hidden_states
     return hidden_states
+class FourierBBoxEmbedding(nn.Module):
+    """
+    Maps bounding box coordinates to Fourier embeddings, then projects to higher dimension.
+    
+    Input shape: [B, N, 4] where:
+        B: batch size
+        N: number of objects
+        4: bbox coordinates (usually x1, y1, x2, y2 or x, y, w, h)
+    
+    Output shape: [B, N, 1536] where 1536 is the final embedding dimension
+    """
+    def __init__(self, input_dim=4, fourier_dim=8, output_dim=1536):
+        super().__init__()
+        assert fourier_dim % (2 * input_dim) == 0, "Fourier dimension must be divisible by 2 * input_dim"
+        
+        self.input_dim = input_dim
+        self.fourier_dim = fourier_dim
+        self.output_dim = output_dim
+        self.freq_bands = fourier_dim // (2 * input_dim)
+        
+        # Generate frequency bands for the embedding
+        # Using exponential distribution for the frequencies
+        self.register_buffer(
+            "frequencies", 
+            2.0 ** torch.linspace(0, self.freq_bands - 1, self.freq_bands)
+        )
+        
+        # Linear projection from fourier_dim to output_dim
+        self.projection = nn.Linear(fourier_dim, output_dim)
+        
+        # Initialize the projection with normal distribution
+        
+        
+    def _get_fourier_embedding(self, bbox):
+        """
+        Transform bbox coordinates to Fourier embeddings
+        
+        Args:
+            bbox: Tensor of shape [B, N, 4] with bbox coordinates
+        Returns:
+            Tensor of shape [B, N, fourier_dim] with Fourier embeddings
+        """
+        # Get original shape for reshaping at the end
+        B, N, _ = bbox.shape
+        
+        # Reshape to [B*N, 4] for easier processing
+        flat_bbox = bbox.reshape(-1, self.input_dim)
+        
+        # Initialize output tensor
+        embeddings = torch.zeros(flat_bbox.shape[0], self.fourier_dim, device=bbox.device)
+        
+        # For each coordinate in the bounding box
+        for dim in range(self.input_dim):
+            # Get the coordinate values
+            coords = flat_bbox[:, dim]
+            
+            # For each frequency band
+            for band_idx in range(self.freq_bands):
+                # Calculate the frequency
+                freq = self.frequencies[band_idx]
+                
+                # Calculate indices for sin and cos values
+                sin_idx = dim * 2 * self.freq_bands + band_idx
+                cos_idx = dim * 2 * self.freq_bands + band_idx + self.freq_bands
+                
+                # Apply sinusoidal encoding
+                embeddings[:, sin_idx] = torch.sin(coords * freq)
+                embeddings[:, cos_idx] = torch.cos(coords * freq)
+        
+        # Reshape back to original batch dimensions with fourier embedding dimension
+        embeddings = embeddings.reshape(B, N, self.fourier_dim)
+        
+        return embeddings
+        
+    def forward(self, bbox):
+        """
+        Args:
+            bbox: Tensor of shape [B, N, 4] with bbox coordinates
+        Returns:
+            Tensor of shape [B, N, output_dim] with final embeddings
+        """
+        # Get Fourier embeddings
+        fourier_embeddings = self._get_fourier_embedding(bbox)
+        
+        # Project to higher dimension
+        # Reshape for batch processing through linear layer
+        B, N, D = fourier_embeddings.shape
+        flat_embeddings = fourier_embeddings.reshape(-1, D)
+        flat_embeddings = flat_embeddings.to(torch.bfloat16)
+        # Apply projection
+        
+        projected_embeddings = self.projection(flat_embeddings)
+        
+        # Reshape back to batch format
+        output_embeddings = projected_embeddings.reshape(B, N, self.output_dim)
+        
+        return output_embeddings
 
 
 class RoPEEmbedding(torch.nn.Module):
@@ -42,8 +143,141 @@ class RoPEEmbedding(torch.nn.Module):
         return emb.unsqueeze(1)
 
 
-
 class FluxJointAttention(torch.nn.Module):
+    def __init__(self, dim_a, dim_b, num_heads, head_dim, only_out_a=False):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.only_out_a = only_out_a
+
+        self.a_to_qkv = torch.nn.Linear(dim_a, dim_a * 3)
+        self.b_to_qkv = torch.nn.Linear(dim_b, dim_b * 3)
+        self.c_to_qkv = torch.nn.Linear(512, dim_a * 3)
+        self.norm_q_a = RMSNorm(head_dim, eps=1e-6)
+        self.norm_k_a = RMSNorm(head_dim, eps=1e-6)
+        self.norm_q_b = RMSNorm(head_dim, eps=1e-6)
+        self.norm_k_b = RMSNorm(head_dim, eps=1e-6)
+        self.norm_q_c = RMSNorm(head_dim, eps=1e-6)
+        self.norm_k_c = RMSNorm(head_dim, eps=1e-6)
+
+        self.a_to_out = torch.nn.Linear(dim_a, dim_a)
+        self.c_to_out = torch.nn.Linear(dim_a, 512)
+        if not only_out_a:
+            self.b_to_out = torch.nn.Linear(dim_b, dim_b)
+
+
+    def apply_rope(self, xq, xk, freqs_cis):
+        xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
+        xk_ = xk.float().reshape(*xk.shape[:-1], -1, 1, 2)
+        xq_out = freqs_cis[..., 0] * xq_[..., 0] + freqs_cis[..., 1] * xq_[..., 1]
+        xk_out = freqs_cis[..., 0] * xk_[..., 0] + freqs_cis[..., 1] * xk_[..., 1]
+        return xq_out.reshape(*xq.shape).type_as(xq), xk_out.reshape(*xk.shape).type_as(xk)
+
+    def forward(self, hidden_states_a, hidden_states_b,hidden_states_c, image_rotary_emb, attn_mask=None, ipadapter_kwargs_list=None):
+        batch_size = hidden_states_a.shape[0]
+
+        # Part A
+        qkv_a = self.a_to_qkv(hidden_states_a)
+        qkv_a = qkv_a.view(batch_size, -1, 3 * self.num_heads, self.head_dim).transpose(1, 2)
+        q_a, k_a, v_a = qkv_a.chunk(3, dim=1)
+        q_a, k_a = self.norm_q_a(q_a), self.norm_k_a(k_a)
+
+        # Part B
+        qkv_b = self.b_to_qkv(hidden_states_b)
+        qkv_b = qkv_b.view(batch_size, -1, 3 * self.num_heads, self.head_dim).transpose(1, 2)
+        q_b, k_b, v_b = qkv_b.chunk(3, dim=1)
+        q_b, k_b = self.norm_q_b(q_b), self.norm_k_b(k_b)
+        # Part C
+        qkv_c = self.c_to_qkv(hidden_states_c)
+        qkv_c = qkv_c.view(batch_size, -1, 3 * self.num_heads, self.head_dim).transpose(1, 2)
+        q_c, k_c, v_c = qkv_c.chunk(3, dim=1)
+        q_c, k_c = self.norm_q_c(q_c), self.norm_k_c(k_c)
+
+        q = torch.concat([q_b, q_a,q_c], dim=2)
+        k = torch.concat([k_b, k_a,k_c], dim=2)
+        v = torch.concat([v_b, v_a,v_c], dim=2)
+
+        q, k = self.apply_rope(q, k, image_rotary_emb)
+
+        hidden_states = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, self.num_heads * self.head_dim)
+        hidden_states = hidden_states.to(q.dtype)
+        hidden_states_b, hidden_states_a,hidden_states_c = hidden_states[:, :hidden_states_b.shape[1]], hidden_states[:, hidden_states_b.shape[1]:hidden_states_b.shape[1]+hidden_states_a.shape[1]],hidden_states[:, hidden_states_b.shape[1]+hidden_states_a.shape[1]:]
+        if ipadapter_kwargs_list is not None:
+            hidden_states_a = interact_with_ipadapter(hidden_states_a, q_a, **ipadapter_kwargs_list)
+        hidden_states_a = self.a_to_out(hidden_states_a)
+        hidden_states_c = self.c_to_out(hidden_states_c)
+        if self.only_out_a:
+            return hidden_states_a
+        else:
+            hidden_states_b = self.b_to_out(hidden_states_b)
+            return hidden_states_a, hidden_states_b,hidden_states_c
+
+
+
+class FluxJointTransformerBlock(torch.nn.Module):
+    def __init__(self, dim, num_attention_heads):
+        super().__init__()
+        self.norm1_a = AdaLayerNorm(dim)
+        self.norm1_b = AdaLayerNorm(dim)
+        self.norm1_c = AdaLayerNorm(512)
+        self.attn = FluxJointAttention(dim, dim, num_attention_heads, dim // num_attention_heads)
+
+        self.norm2_a = torch.nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.ff_a = torch.nn.Sequential(
+            torch.nn.Linear(dim, dim*4),
+            torch.nn.GELU(approximate="tanh"),
+            torch.nn.Linear(dim*4, dim)
+        )
+
+        self.norm2_b = torch.nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.ff_b = torch.nn.Sequential(
+            torch.nn.Linear(dim, dim*4),
+            torch.nn.GELU(approximate="tanh"),
+            torch.nn.Linear(dim*4, dim)
+        )
+
+        #self.norm_c_1 = torch.nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        #self.norm_c_2 = torch.nn.LayerNorm(512, elementwise_affine=False, eps=1e-6)
+        self.norm2_c = torch.nn.LayerNorm(512, elementwise_affine=False, eps=1e-6)
+        self.ff_c = torch.nn.Sequential(
+            torch.nn.Linear(512, 512),
+            torch.nn.GELU(approximate="tanh"),
+            torch.nn.Linear(512, 512)
+        )
+
+
+    def forward(self, hidden_states_a, hidden_states_b,hidden_states_c, temb,bbox_temb, image_rotary_emb, attn_mask=None, ipadapter_kwargs_list=None):
+        norm_hidden_states_a, gate_msa_a, shift_mlp_a, scale_mlp_a, gate_mlp_a = self.norm1_a(hidden_states_a, emb=temb)
+        norm_hidden_states_b, gate_msa_b, shift_mlp_b, scale_mlp_b, gate_mlp_b = self.norm1_b(hidden_states_b, emb=temb)
+        #hidden_states_c = self.bbox_to_dim(hidden_states_c)
+        norm_hidden_states_c, gate_msa_c, shift_mlp_c, scale_mlp_c, gate_mlp_c = self.norm1_c(hidden_states_c, emb=bbox_temb)
+        # Attention
+        #norm_hidden_states_c = self.bbox_to_dim(norm_hidden_states_c)
+        #norm_hidden_states_c = self.norm_c_1(norm_hidden_states_c)
+        attn_output_a, attn_output_b , attn_output_c= self.attn(norm_hidden_states_a, norm_hidden_states_b,norm_hidden_states_c, image_rotary_emb, attn_mask, ipadapter_kwargs_list)
+        #attn_output_c = attn_output_a[:, -hidden_states_c.shape[1]:]
+        #attn_output_a = attn_output_a[:, :-hidden_states_c.shape[1]]
+        #print(attn_output_c.shape,attn_output_a.shape)
+        #attn_output_c = self.norm_c_2(self.dim_to_bbox(attn_output_c))
+        # Part A
+        hidden_states_a = hidden_states_a + gate_msa_a * attn_output_a
+        norm_hidden_states_a = self.norm2_a(hidden_states_a) * (1 + scale_mlp_a) + shift_mlp_a
+        hidden_states_a = hidden_states_a + gate_mlp_a * self.ff_a(norm_hidden_states_a)
+
+        # Part B
+        hidden_states_b = hidden_states_b + gate_msa_b * attn_output_b
+        norm_hidden_states_b = self.norm2_b(hidden_states_b) * (1 + scale_mlp_b) + shift_mlp_b
+        hidden_states_b = hidden_states_b + gate_mlp_b * self.ff_b(norm_hidden_states_b)
+
+        hidden_states_c = hidden_states_c + gate_msa_c * attn_output_c
+        norm_hidden_states_c = self.norm2_c(hidden_states_c) * (1 + scale_mlp_c) + shift_mlp_c
+        hidden_states_c = hidden_states_c + gate_mlp_c * self.ff_c(norm_hidden_states_c)
+        return hidden_states_a, hidden_states_b,hidden_states_c
+
+
+
+"""class FluxJointAttention(torch.nn.Module):
     def __init__(self, dim_a, dim_b, num_heads, head_dim, only_out_a=False):
         super().__init__()
         self.num_heads = num_heads
@@ -111,7 +345,10 @@ class FluxJointTransformerBlock(torch.nn.Module):
         super().__init__()
         self.norm1_a = AdaLayerNorm(dim)
         self.norm1_b = AdaLayerNorm(dim)
-
+        self.norm1_c = AdaLayerNorm(512)
+        self.bbox_temb = torch.nn.Linear(dim, 512)
+        self.bbox_to_dim = torch.nn.Linear(512, dim)
+        self.dim_to_bbox = torch.nn.Linear(dim, 512)
         self.attn = FluxJointAttention(dim, dim, num_attention_heads, dim // num_attention_heads)
 
         self.norm2_a = torch.nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
@@ -128,14 +365,29 @@ class FluxJointTransformerBlock(torch.nn.Module):
             torch.nn.Linear(dim*4, dim)
         )
 
+        self.norm_c_1 = torch.nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.norm_c_2 = torch.nn.LayerNorm(512, elementwise_affine=False, eps=1e-6)
+        self.norm2_c = torch.nn.LayerNorm(512, elementwise_affine=False, eps=1e-6)
+        self.ff_c = torch.nn.Sequential(
+            torch.nn.Linear(512, 512),
+            torch.nn.GELU(approximate="tanh"),
+            torch.nn.Linear(512, 512)
+        )
 
-    def forward(self, hidden_states_a, hidden_states_b, temb, image_rotary_emb, attn_mask=None, ipadapter_kwargs_list=None):
+
+    def forward(self, hidden_states_a, hidden_states_b,hidden_states_c, temb, image_rotary_emb, attn_mask=None, ipadapter_kwargs_list=None):
         norm_hidden_states_a, gate_msa_a, shift_mlp_a, scale_mlp_a, gate_mlp_a = self.norm1_a(hidden_states_a, emb=temb)
         norm_hidden_states_b, gate_msa_b, shift_mlp_b, scale_mlp_b, gate_mlp_b = self.norm1_b(hidden_states_b, emb=temb)
-
+        #hidden_states_c = self.bbox_to_dim(hidden_states_c)
+        norm_hidden_states_c, gate_msa_c, shift_mlp_c, scale_mlp_c, gate_mlp_c = self.norm1_c(hidden_states_c, emb=self.bbox_temb(temb))
         # Attention
-        attn_output_a, attn_output_b = self.attn(norm_hidden_states_a, norm_hidden_states_b, image_rotary_emb, attn_mask, ipadapter_kwargs_list)
-
+        norm_hidden_states_c = self.bbox_to_dim(norm_hidden_states_c)
+        norm_hidden_states_c = self.norm_c_1(norm_hidden_states_c)
+        attn_output_a, attn_output_b = self.attn(torch.cat([norm_hidden_states_a,norm_hidden_states_c],dim=1), norm_hidden_states_b, image_rotary_emb, attn_mask, ipadapter_kwargs_list)
+        attn_output_c = attn_output_a[:, -hidden_states_c.shape[1]:]
+        attn_output_a = attn_output_a[:, :-hidden_states_c.shape[1]]
+        #print(attn_output_c.shape,attn_output_a.shape)
+        attn_output_c = self.norm_c_2(self.dim_to_bbox(attn_output_c))
         # Part A
         hidden_states_a = hidden_states_a + gate_msa_a * attn_output_a
         norm_hidden_states_a = self.norm2_a(hidden_states_a) * (1 + scale_mlp_a) + shift_mlp_a
@@ -146,10 +398,10 @@ class FluxJointTransformerBlock(torch.nn.Module):
         norm_hidden_states_b = self.norm2_b(hidden_states_b) * (1 + scale_mlp_b) + shift_mlp_b
         hidden_states_b = hidden_states_b + gate_mlp_b * self.ff_b(norm_hidden_states_b)
 
-        return hidden_states_a, hidden_states_b
-
-
-
+        hidden_states_c = hidden_states_c + gate_msa_c * attn_output_c
+        norm_hidden_states_c = self.norm2_c(hidden_states_c) * (1 + scale_mlp_c) + shift_mlp_c
+        hidden_states_c = hidden_states_c + gate_mlp_c * self.ff_c(norm_hidden_states_c)
+        return hidden_states_a, hidden_states_b,hidden_states_c"""
 class FluxSingleAttention(torch.nn.Module):
     def __init__(self, dim_a, dim_b, num_heads, head_dim):
         super().__init__()
@@ -287,12 +539,16 @@ class FluxDiT(torch.nn.Module):
         self.pooled_text_embedder = torch.nn.Sequential(torch.nn.Linear(768, 3072), torch.nn.SiLU(), torch.nn.Linear(3072, 3072))
         self.context_embedder = torch.nn.Linear(4096, 3072)
         self.x_embedder = torch.nn.Linear(64, 3072)
+        self.bbox_embedder = FourierBBoxEmbedding(input_dim=4, fourier_dim=8, output_dim=512)
 
         self.blocks = torch.nn.ModuleList([FluxJointTransformerBlock(3072, 24) for _ in range(19)])
         self.single_blocks = torch.nn.ModuleList([FluxSingleTransformerBlock(3072, 24) for _ in range(38)])
 
         self.final_norm_out = AdaLayerNormContinuous(3072)
+        self.final_bbox_out = torch.nn.Linear(512, 4)
         self.final_proj_out = torch.nn.Linear(3072, 64)
+        self.bbox_temb = torch.nn.Linear(3072, 512)
+        
 
 
     def patchify(self, hidden_states):
@@ -341,25 +597,34 @@ class FluxDiT(torch.nn.Module):
         return hidden_states
 
 
-    def construct_mask(self, entity_masks, prompt_seq_len, image_seq_len):
+    def construct_mask(self, entity_masks, prompt_seq_len, image_seq_len,bbox_seq_len):
         N = len(entity_masks)
-        print(N,prompt_seq_len,image_seq_len)
+        #print(N,prompt_seq_len,image_seq_len)
         
         batch_size = entity_masks[0].shape[0]
-        total_seq_len = N * prompt_seq_len + image_seq_len
+        total_seq_len = N * prompt_seq_len + image_seq_len + bbox_seq_len
         patched_masks = [self.patchify(entity_masks[i]) for i in range(N)]
-        print(patched_masks[0].shape,"####################")
         attention_mask = torch.ones((batch_size, total_seq_len, total_seq_len), dtype=torch.bool).to(device=entity_masks[0].device)
 
         image_start = N * prompt_seq_len
         image_end = N * prompt_seq_len + image_seq_len
+        bbox_start = image_end
+        bbox_end = bbox_start + bbox_seq_len
         # prompt-image mask
         for i in range(N):
             prompt_start = i * prompt_seq_len
             prompt_end = (i + 1) * prompt_seq_len
+            bbox_start_i = bbox_start+i
+            bbox_end_i = bbox_start_i + 1
             image_mask = torch.sum(patched_masks[i], dim=-1) > 0
             image_mask = image_mask.unsqueeze(1).repeat(1, prompt_seq_len, 1)
+            bbox_mask = (torch.sum(patched_masks[i], dim=-1) > 0).unsqueeze(1)
             # prompt update with image
+            attention_mask[:, bbox_start_i:bbox_end_i, prompt_start:prompt_end] = True
+            attention_mask[:, prompt_start:prompt_end,bbox_start_i:bbox_end_i] = True
+            #print(bbox_mask.shape,image_mask.shape)
+            attention_mask[:, bbox_start_i:bbox_end_i, image_start:image_end] = bbox_mask
+            attention_mask[:, image_start:image_end, bbox_start_i:bbox_end_i] = bbox_mask.transpose(1, 2)  
             attention_mask[:, prompt_start:prompt_end, image_start:image_end] = image_mask
             # image update with prompt
             attention_mask[:, image_start:image_end, prompt_start:prompt_end] = image_mask.transpose(1, 2)
@@ -372,6 +637,8 @@ class FluxDiT(torch.nn.Module):
                     prompt_start_j = j * prompt_seq_len
                     prompt_end_j = (j + 1) * prompt_seq_len
                     attention_mask[:, prompt_start_i:prompt_end_i, prompt_start_j:prompt_end_j] = False
+                    attention_mask[:,bbox_start+i:bbox_start+i+1,bbox_start+j:bbox_start+j+1] = False
+
 
         attention_mask = attention_mask.float()
         attention_mask[attention_mask == 0] = float('-inf')
@@ -379,12 +646,12 @@ class FluxDiT(torch.nn.Module):
         return attention_mask
 
 
-    def process_entity_masks(self, hidden_states, prompt_emb, entity_prompt_emb, entity_masks, text_ids, image_ids):
+    def process_entity_masks(self, hidden_states, prompt_emb, entity_prompt_emb, entity_masks, text_ids, image_ids,bbox_ids = None):
         repeat_dim = hidden_states.shape[1]
         max_masks = 0
         attention_mask = None
         prompt_embs = [prompt_emb]
-        print(hidden_states.shape,prompt_emb.shape,entity_prompt_emb.shape,entity_masks.shape)
+        #print(hidden_states.shape,prompt_emb.shape,entity_prompt_emb.shape,entity_masks.shape)
         if entity_masks is not None:
             # entity_masks
             batch_size, max_masks = entity_masks.shape[0], entity_masks.shape[1]
@@ -394,7 +661,7 @@ class FluxDiT(torch.nn.Module):
             global_mask = torch.ones_like(entity_masks[0]).to(device=hidden_states.device, dtype=hidden_states.dtype)
             entity_masks = entity_masks + [global_mask] # append global to last
             # attention mask
-            attention_mask = self.construct_mask(entity_masks, prompt_emb.shape[1], hidden_states.shape[1])
+            attention_mask = self.construct_mask(entity_masks, prompt_emb.shape[1], hidden_states.shape[1],bbox_ids.shape[1])
             attention_mask = attention_mask.to(device=hidden_states.device, dtype=hidden_states.dtype)
             attention_mask = attention_mask.unsqueeze(1)
             # embds: n_masks * b * seq * d
@@ -402,10 +669,10 @@ class FluxDiT(torch.nn.Module):
             prompt_embs = local_embs + prompt_embs # append global to last
         prompt_embs = [self.context_embedder(prompt_emb) for prompt_emb in prompt_embs]
         prompt_emb = torch.cat(prompt_embs, dim=1)
-        print(prompt_emb.shape)
         # positional embedding
         text_ids = torch.cat([text_ids] * (max_masks + 1), dim=1)
-        image_rotary_emb = self.pos_embedder(torch.cat((text_ids, image_ids), dim=1))
+        #print(text_ids.shape,text_ids.sum())
+        image_rotary_emb = self.pos_embedder(torch.cat((text_ids, image_ids,bbox_ids), dim=1))
         return prompt_emb, image_rotary_emb, attention_mask
 
 
