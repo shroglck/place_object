@@ -3,21 +3,31 @@ import torch
 import os 
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from IPython.core.debugger import set_trace 
 from layoutsam.utils.bbox_visualization import bbox_visualization,scale_boxes
 from PIL import Image
-from layoutsam.src.models.transformer_sd3_SiamLayout import SiamLayoutSD3Transformer2DModel
+from layoutsam.src.models.transformer_sd3_SiamLayout_lora import SiamLayoutSD3Transformer2DModel
 from layoutsam.src.pipeline.pipeline_sd3_CreatiLayout import CreatiLayoutSD3Pipeline
 from layoutsam.dataset.layoutsam_benchmark import BboxDataset
 from datasets import load_dataset
+from safetensors.torch import load_file
+from huggingface_hub import hf_hub_download
 
 if __name__ == "__main__":
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model_path = "stabilityai/stable-diffusion-3-medium-diffusers"
-    ckpt_path = "HuiZhang0812/CreatiLayout"
     dataset_path = "HuiZhang0812/LayoutSAM-eval"
-    transformer_additional_kwargs = dict(attention_type="layout",strict=True)
+    transformer_additional_kwargs = dict(attention_type="layout",strict=False,device_map=None,low_cpu_mem_usage=False)
     transformer = SiamLayoutSD3Transformer2DModel.from_pretrained(
-         ckpt_path, subfolder="SiamLayout_SD3", torch_dtype=torch.bfloat16,**transformer_additional_kwargs)
+         model_path, subfolder="transformer", torch_dtype=torch.bfloat16,**transformer_additional_kwargs)
+    
+    ckpt_path = "HuiZhang0812/CreatiLayout"
+    safetensors_path = hf_hub_download(
+        repo_id=ckpt_path,
+        filename="SiamLayout_SD3_lora/model.safetensors"
+    )
+    lora_state_dict = load_file(safetensors_path)
+    missing_keys, unexpected_keys = transformer.load_state_dict(lora_state_dict, strict=False)
     pipe = CreatiLayoutSD3Pipeline.from_pretrained(model_path, transformer=transformer, torch_dtype=torch.bfloat16)
     pipe = pipe.to(device)
 
@@ -31,7 +41,7 @@ if __name__ == "__main__":
     height = 1024
     width = 1024
 
-    save_root = "output/layoutSAM-eval-SiamLayout-SD3"
+    save_root = "/mnt/sphere/ddivyansh-shared/ControlImageGen/baseline/layoutSAM-eval-SiamLayout-SD3-lora"
     img_save_root = os.path.join(save_root,"images")
     os.makedirs(img_save_root,exist_ok=True)
     img_with_layout_save_root = os.path.join(save_root,"images_with_layout")
@@ -72,5 +82,5 @@ if __name__ == "__main__":
         new_image.paste(bbox_visualization_img, (0, 0))
         new_image.paste(image_with_bbox, (width, 0))
         new_image.save(img_with_layout_save_name)
-        break
+
 
