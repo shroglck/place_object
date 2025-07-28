@@ -21,7 +21,7 @@ if __name__ == "__main__":
     test_dataset = BboxDataset(test_dataset)
     test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=1)
 
-    generate_path = "output/layoutSAM-eval-SiamLayout-SD3/images"   
+    generate_path = "/mnt/sphere/ddivyansh-shared/ControlImageGen/baseline/layoutSAM-eval-SiamLayout-SD3/images"   
     print("processing:",generate_path)
 
     save_json_path = generate_path.replace("images", "minicpm-vqa.json")
@@ -32,8 +32,6 @@ if __name__ == "__main__":
     # Dictionary to store the count and scores for each image
     image_stats = {}
     for i, batch in enumerate(tqdm(test_dataloader)):
-        if i==35:
-            break
         global_caption = batch["global_caption"]
         detial_region_caption_list = [t[0] for t in batch["detail_region_caption_list"]]
         region_caption_list = [t[0] for t in batch["region_caption_list"]]

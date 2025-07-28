@@ -68,7 +68,7 @@ def bbox_visualization(image_pil: Image,
     
     # Load a font with the specified size
     font_size = font_size
-    font = ImageFont.truetype("utils/arial.ttf", font_size)
+    font = ImageFont.truetype("layoutsam/utils/arial.ttf", font_size)
     
     # Create a PIL ImageDraw object to draw on the input image
     if isinstance(image_pil, np.ndarray):
