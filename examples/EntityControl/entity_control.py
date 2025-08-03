@@ -79,12 +79,12 @@ def example(pipe, seeds, example_id, global_prompt, entity_prompts,image_path=No
     masks = [Image.open(f"./data/examples/eligen/entity_control/example_{example_id}/{i}.png").convert('RGB') for i in range(len(entity_prompts))]
     negative_prompt = "worst quality, low quality, monochrome, zombie, interlocked fingers, Aissist, cleavage, nsfw,"
     #masks =  [masks[2],masks[6]]
-    bboxes = [torch.tensor(get_bboxes_from_mask(np.array(mask))).to("cuda:5")/1024 for mask in masks]
+    bboxes = [torch.tensor(get_bboxes_from_mask(np.array(mask))).to("cuda")/1024 for mask in masks]
     target_height, target_width = 1024, 1024
     masks = []
-    pipe.load_specific_layers()
-    pipe.to("cuda:5")
-    pipe.device = "cuda:5"
+    pipe.load_specific_layers(path="/mnt/sphere/ddivyansh-shared/ControlImageGen/models/lr_8_one_step")
+    pipe.to("cuda")
+    pipe.device = "cuda"
     for i in bboxes:
         mask = np.zeros((target_height,target_width,3))
         mask[int(i[0][1]*target_height):int(i[0][3]*target_height),int(i[0][0]*target_width):int(i[0][2]*target_width),:] = 255.0
@@ -122,7 +122,7 @@ else:
     model_id = "modelscope/EliGen"
     downloading_priority = ["HuggingFace"]
 
-model_manager.load_lora("/data/shresth/DiffSynth-Studio/lightning_logs/version_22/checkpoints/epoch=2-step=9000.ckpt", lora_alpha=1)
+model_manager.load_lora("/mnt/sphere/ddivyansh-shared/ControlImageGen/models/lr_8_one_step", lora_alpha=1)
 """download_customized_models(
     model_id=model_id,
     origin_file_path="model_bf16.safetensors",

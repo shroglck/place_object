@@ -14,21 +14,20 @@ if __name__ == "__main__":
     model = model.eval().cuda()
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 
-
     # evaluation
     dataset_path = "HuiZhang0812/LayoutSAM-eval"
     test_dataset = load_dataset(dataset_path, split='test')
     test_dataset = BboxDataset(test_dataset)
     test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=1)
 
-    generate_path = "/mnt/sphere/ddivyansh-shared/ControlImageGen/baseline/layoutSAM-eval-SiamLayout-SD3/images"   
+    generate_path = "/mnt/sphere/ddivyansh-shared/ControlImageGen/baseline/layoutSAM-eval/images"   
     print("processing:",generate_path)
 
     save_json_path = generate_path.replace("images", "minicpm-vqa.json")
     temp_root = generate_path.replace("images", "images-perarea")
     os.makedirs(temp_root, exist_ok=True)  #
 
-    resolution= 512 # if sd3, resolution=1024; if flux, resolution=512
+    resolution= 1024 # if sd3, resolution=1024; if flux, resolution=512
     # Dictionary to store the count and scores for each image
     image_stats = {}
     for i, batch in enumerate(tqdm(test_dataloader)):
