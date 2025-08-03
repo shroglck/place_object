@@ -31,7 +31,7 @@ if __name__ == "__main__":
     test_dataset = BboxDataset(test_dataset)
     test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=1)
 
-    generate_path = "/mnt/sphere/ddivyansh-shared/ControlImageGen/baseline/layoutSAM-eval/images"   
+    generate_path = "/mnt/sphere/ddivyansh-shared/ControlImageGen/baseline/layoutSAM-eval-SiamLayout-SD3-lora/images"   
     print("processing:", generate_path)
     save_path = generate_path.replace("images", "clip.txt")
     
