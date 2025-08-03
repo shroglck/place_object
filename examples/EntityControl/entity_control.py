@@ -82,7 +82,7 @@ def example(pipe, seeds, example_id, global_prompt, entity_prompts,image_path=No
     bboxes = [torch.tensor(get_bboxes_from_mask(np.array(mask))).to("cuda")/1024 for mask in masks]
     target_height, target_width = 1024, 1024
     masks = []
-    pipe.load_specific_layers(path="/mnt/sphere/ddivyansh-shared/ControlImageGen/models/lr_8_one_step")
+    #pipe.load_specific_layers(path="/mnt/sphere/ddivyansh-shared/ControlImageGen/models/lr_8_one_step")
     pipe.to("cuda")
     pipe.device = "cuda"
     for i in bboxes:
@@ -133,7 +133,9 @@ lora_alpha=1
 )"""
 
 pipe = FluxImagePipeline.from_model_manager(model_manager)
-
+lora_path = "/mnt/sphere/ddivyansh-shared/ControlImageGen/models/lr_8_one_step"
+weights_dict = torch.load(lora_path, map_location='cpu')  # Load to CPU first for memory efficiency
+pipe.dit.load_state_dict(weights_dict, strict=False)
 # example 1
 s = random.randint(0, 1000000)
 image_path = "/data/shresth/DiffSynth-Studio/flux_eligen_example_1_350170.png"
