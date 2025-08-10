@@ -4,8 +4,8 @@ from torch.utils.data import DataLoader
 from PIL import Image
 from datasets import load_dataset
 from layoutsam.dataset.layoutsam_benchmark import BboxDataset
-from diffsynth import ModelManager, FluxImagePipeline, download_customized_models
-from examples.EntityControl.utils import visualize_masks
+from diffsynth import ModelManager, FluxImagePipeline
+from layoutsam.utils.bbox_visualization import bbox_visualization,scale_boxes
 import numpy as np
 from accelerate import Accelerator
 from accelerate.utils.tqdm import tqdm
@@ -28,20 +28,15 @@ if __name__ == "__main__":
     else:
         model_id = "modelscope/EliGen"
         downloading_priority = ["HuggingFace"]
-    model_manager.load_lora(
-        download_customized_models(
-            model_id=model_id,
-            origin_file_path="model_bf16.safetensors",
-            local_dir="models/lora/entity_control",
-            downloading_priority=downloading_priority
-        ),
-        lora_alpha=1
-    )
+    model_manager.load_lora("/mnt/sphere/ddivyansh-shared/ControlImageGen/models/lr_8_one_step", lora_alpha=1)
     pipe = FluxImagePipeline.from_model_manager(model_manager)
+    lora_path = "/mnt/sphere/ddivyansh-shared/ControlImageGen/models/lr_8_one_step"
+    weights_dict = torch.load(lora_path, map_location='cpu')  # Load to CPU first for memory efficiency
+    pipe.dit.load_state_dict(weights_dict, strict=False)
     pipe.to(device)
     pipe.device = device
 
-    save_root = "/mnt/sphere/ddivyansh-shared/ControlImageGen/baseline/layoutSAM-eval-Eligen-FLUX"
+    save_root = "/mnt/sphere/ddivyansh-shared/ControlImageGen/baseline/layoutSAM-eval-Ours-FLUX-lora8"
     img_save_root = os.path.join(save_root, "images")
     os.makedirs(img_save_root, exist_ok=True)
     img_with_layout_save_root = os.path.join(save_root, "images_with_layout")
@@ -53,24 +48,49 @@ if __name__ == "__main__":
         region_caption_list = [t[0] for t in batch["detail_region_caption_list"]]
         region_bboxes_list = batch["region_bboxes_list"][0]
         filename = batch["file_name"][0]
+        
+        target_height, target_width = 1024, 1024
         masks = []
+        image_path = f"{img_save_root}/{filename}"
+        # if os.path.exists(image_path):
+        #     print(f"Image {image_path} already exists, skipping...")
+        #     continue
         with torch.no_grad():
             bboxes = [box.unsqueeze(0).to(device) for box in region_bboxes_list]
             for bbox in bboxes:
-                mask = np.zeros((1024, 1024, 3))
-                mask[int(bbox[0][1]*1024):int(bbox[0][3]*1024), int(bbox[0][0]*1024):int(bbox[0][2]*1024), :] = 255.0
+                mask = np.zeros((target_height, target_width, 3))
+                mask[int(bbox[0][1]*target_height):int(bbox[0][3]*target_height), int(bbox[0][0]*target_width):int(bbox[0][2]*target_width), :] = 255.0
                 masks.append(Image.fromarray(mask.astype(np.uint8)))
             image = pipe(
+                input_image = None,
                 prompt=global_caption,
                 cfg_scale=3.0,
                 negative_prompt=negative_prompt,
                 num_inference_steps=50,
                 embedded_guidance=3.5,
                 seed=0,
-                height=1024,
-                width=1024,
+                bbox=bboxes,
+                height=target_height,
+                width=target_width,
                 eligen_entity_prompts=region_caption_list,
                 eligen_entity_masks=masks,
+                local_prompts=region_caption_list
             )
-            image.save(f"{img_save_root}/{filename}.png")
-            visualize_masks(image, masks, region_caption_list, f"{img_with_layout_save_root}/{filename}.png")
+            image.save(image_path)
+            
+            
+            img_with_layout_save_name=os.path.join(img_with_layout_save_root, filename)
+
+            white_image = Image.new('RGB', (target_width, target_height), color='rgb(256,256,256)')
+            show_input = {"boxes":scale_boxes(region_bboxes_list, target_width, target_height),"labels":region_caption_list}
+
+            bbox_visualization_img = bbox_visualization(white_image,show_input)
+            image_with_bbox = bbox_visualization(image ,show_input)
+
+            total_width = target_width*2
+            total_height = target_height
+
+            new_image = Image.new('RGB', (total_width, total_height))
+            new_image.paste(bbox_visualization_img, (0, 0))
+            new_image.paste(image_with_bbox, (target_width, 0))
+            new_image.save(img_with_layout_save_name)
