@@ -213,6 +213,7 @@ class FluxImagePipeline(BasePipeline):
         """
         print("loading from",path)
         weights_dict = torch.load(path)
+        weights_dict = weights_dict["lora_state_dict"]
         loaded_keys = []
         d = self.device
         self.dit = self.dit.cpu()
@@ -385,7 +386,7 @@ class FluxImagePipeline(BasePipeline):
             else:
                 mask = F.interpolate(mask.unsqueeze(0), size=(height, width,3), mode='nearest').squeeze(0).squeeze(0)
                 d = mask.device
-                mask = np.array(mask.cpu())
+                mask = np.array(mask.cpu().float())
                 
                 mask = self.preprocess_image(mask).mean(dim=1, keepdim=True) > 0
             

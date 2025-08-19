@@ -1,15 +1,10 @@
 from diffsynth import ModelManager, FluxImagePipeline
 from diffsynth.trainers.text_to_image import LightningModelForT2ILoRA, add_general_parsers, launch_training_task
 from diffsynth.models.lora import FluxLoRAConverter
-from diffsynth.models import FluxDiT
-import numpy as np
-from PIL import Image
 import torch, os, argparse
 import torch.nn as nn
-from torch.optim.lr_scheduler import CosineAnnealingLR
-
 from torch.nn import init
-os.environ["TOKENIZERS_PARALLELISM"] = "True"
+# os.environ["TOKENIZERS_PARALLELISM"] = "True"
 
 def set_trainable_parameters(model, patterns="_c", initialize=True):
     """
@@ -32,7 +27,7 @@ def set_trainable_parameters(model, patterns="_c", initialize=True):
         total_count += 1
         for pattern in patterns:
             if pattern in name:
-                print(name)
+                # print(name)
                 param.requires_grad = True
                 trainable_count += 1
                 
@@ -54,21 +49,21 @@ def set_trainable_parameters(model, patterns="_c", initialize=True):
 class LightningModel(LightningModelForT2ILoRA):
     def __init__(
         self,
-        torch_dtype=torch.bfloat16, pretrained_weights=[], preset_lora_path=None,
+        torch_dtype=torch.float16, pretrained_weights=[], preset_lora_path=None,
         learning_rate=1e-4, use_gradient_checkpointing=True,
         lora_rank=4, lora_alpha=4, lora_target_modules="to_q,to_k,to_v,to_out", init_lora_weights="kaiming", pretrained_lora_path=None,
         state_dict_converter=None, quantize = None
     ):
         super().__init__(learning_rate=learning_rate, use_gradient_checkpointing=use_gradient_checkpointing, state_dict_converter=state_dict_converter)
         # Load models
-        self.automatic_optimization = False
+        # self.automatic_optimization = False
 
         model_manager = ModelManager(torch_dtype=torch_dtype, device=self.device)
         if quantize is None:
             model_manager.load_models(pretrained_weights, torch_dtype=torch_dtype)
         else:
-            model_manager.load_models(pretrained_weights[1:], torch_dtype=torch_dtype)
-            model_manager.load_model(pretrained_weights[0], torch_dtype=torch_dtype)
+            model_manager.load_models(pretrained_weights[1:])
+            model_manager.load_model(pretrained_weights[0], torch_dtype=quantize)
         if preset_lora_path is not None:
             preset_lora_path = preset_lora_path.split(",")
             for path in preset_lora_path:
@@ -106,7 +101,7 @@ class LightningModel(LightningModelForT2ILoRA):
             self.pipe.load_specific_layers(path = pretrained_lora_path)
         
         torch.compile(self.pipe.denoising_model())
-        print(sum(p.numel() for p in self.pipe.parameters() if p.requires_grad))   
+        # print(sum(p.numel() for p in self.pipe.parameters() if p.requires_grad))   
     """ 
     def on_after_backward(self):
         total_norm = 0.0
@@ -120,31 +115,73 @@ class LightningModel(LightningModelForT2ILoRA):
         self.log("train/grad_l2_norm", total_norm, on_step=True, on_epoch=False, prog_bar=True, logger=True)"""
     
     
+    def on_save_checkpoint(self, checkpoint) -> None:
+        # 1) Keep only trainable (LoRA) weights
+        checkpoint.clear()
+        trainable = self.pipe.denoising_model().state_dict()
+        trainable = {
+            k: v
+            for k, v in trainable.items()
+            if any(p.requires_grad and name == k for name, p in
+                   self.pipe.denoising_model().named_parameters())
+        }
+        if self.state_dict_converter is not None:
+            trainable = self.state_dict_converter(trainable, alpha=self.lora_alpha)
+        checkpoint["lora_state_dict"] = trainable
+
+        # 2) Save optimizer + lr‑scheduler manually if needed
+        optimizers = self.optimizers()
+        if optimizers is not None:
+            if not isinstance(optimizers, list):
+                optimizers = [optimizers]
+            checkpoint["optimizer_state_dict"] = optimizers[0].state_dict()
+        
+        schedulers = self.lr_schedulers()
+        if schedulers is not None:
+            if not isinstance(schedulers, list):
+                schedulers = [schedulers]
+            checkpoint["lr_scheduler_state_dict"] = schedulers[0].state_dict()
+
+        # 3) Optionally add training metadata
+        checkpoint["global_step"] = self.global_step if hasattr(self, "global_step") else None
+        checkpoint["epoch"] = self.current_epoch if hasattr(self, "current_epoch") else None
     
+    def on_fit_start(self) -> None:
+        # Called after configure_optimizers()
+        ckpt_path = None
+        if ckpt_path is None:
+            return
+        # Fallback: sometimes trainer.ckpt_path might be None, but resuming still happened:
+        ckpt_meta = getattr(self.trainer, "_checkpoint_connector", None)
+        loaded = getattr(ckpt_meta, "_loaded_ckpt", None)
+
+        ckpt = loaded or (torch.load(ckpt_path) if ckpt_path else None)
+        if not ckpt:
+            return
+
+        # If we saved optimizer_state_dict manually, load it into optimizer(s)
+        optimizers = self.optimizers()
+        if optimizers is not None and "optimizer_state_dict" in ckpt:
+            if not isinstance(optimizers, list):
+                optimizers = [optimizers]
+            optimizers[0].load_state_dict(ckpt["optimizer_state_dict"])
+            print("Loaded optimizer state")
+
+        # Same for lr‑scheduler
+        schedulers = self.lr_schedulers()
+        if schedulers is not None and "lr_scheduler_state_dict" in ckpt:
+            if not isinstance(schedulers, list):
+                schedulers = [schedulers]
+            schedulers[0].load_state_dict(ckpt["lr_scheduler_state_dict"])
+            print("Loaded scheduler state")
+        print("Done!!")
     
     def training_step(self, batch, batch_idx):
-        # Data
-        optimizers = self.optimizers()
-        
-        # Handle both single and multiple optimizer cases
-        if not isinstance(optimizers, list):
-            optimizers = [optimizers]
-        
-        # Get schedulers if they exist
-        schedulers = self.lr_schedulers()
-        for opt in optimizers:
-            #print(opt)
-            opt.zero_grad()
-        
-        if schedulers and not isinstance(schedulers, list):
-            schedulers = [schedulers]
+        rank = os.environ.get('LOCAL_RANK', 'N/A')
         
         text, image = batch["text"], batch["image"]
         
         bbox = 2*(torch.stack(batch['bboxes']).permute(1,0,2)-0.5)
-        #print(bbox)
-        
-        #entity_prompts =[iii[0] for iii in batch["entity_prompt"] if iii[0] != '']
         entity_prompts = []
         entity_masks = []
         for o,iii in enumerate(batch["entity_prompt"]):
@@ -152,23 +189,17 @@ class LightningModel(LightningModelForT2ILoRA):
                 entity_prompts.append(iii[0])
                 entity_masks.append(batch["entity_mask"][o])
 
-        #print(entity_prompts)
         height,width = 1024,1024
-        # Prepare input parameters
-        #print(entity_prompts)
         self.pipe.device = self.device
         prompt_emb = self.pipe.encode_prompt(text, positive=True)
-        prompt_emb_nega = None#self.pipe.encode_prompt( "", positive=False, t5_sequence_length=77)
-        #print(prompt_emb["prompt_emb"].shape,"##############")
+        prompt_emb_nega = None
         eligen_kwargs_posi, eligen_kwargs_nega, fg_mask, bg_mask = self.pipe.prepare_eligen(prompt_emb_nega, entity_prompts, entity_masks, width, height, 512, False, False, 3.5,True)
-        #print()
 
 
         if "latents" in batch:
             latents = batch["latents"].to(dtype=self.pipe.torch_dtype, device=self.device)
         else:
             latents = self.pipe.vae_encoder(image.to(dtype=self.pipe.torch_dtype, device=self.device))
-        #    print(latents.shape)
         noise = torch.randn_like(latents)
         noise_2 = torch.randn_like(bbox)
         timestep_id = torch.randint(0, self.pipe.scheduler.num_train_timesteps, (1,))
@@ -180,7 +211,6 @@ class LightningModel(LightningModelForT2ILoRA):
         training_target = self.pipe.scheduler.training_target(latents, noise, timestep)
 
         # Compute loss
-        
         noise_pred,noise_pred_bbox = lets_dance_flux(
                     dit=self.pipe.denoising_model(),
                     bbox_emb=noisy_bbox,
@@ -188,30 +218,11 @@ class LightningModel(LightningModelForT2ILoRA):
                     **prompt_emb,**extra_input, **eligen_kwargs_posi,
                     conditining = 3.5,
                     use_gradient_checkpointing=self.use_gradient_checkpointing
-                )#self.pipe.denoising_model()(
-            #noisy_latents, timestep=timestep, **prompt_emb, **extra_input,
-           # use_gradient_checkpointing=self.use_gradient_checkpointing
-        #)
+                )
         loss_bbox = torch.nn.functional.mse_loss(noise_pred_bbox.float(), training_bbox.float())
         loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())+loss_bbox
         loss = loss * self.pipe.scheduler.training_weight(timestep)
         
-        
-        # Backward pass
-        self.manual_backward(loss)
-        
-        # Step all optimizers
-        for opt in optimizers:
-            self.clip_gradients(opt, gradient_clip_val=1.0, gradient_clip_algorithm="norm")
-            opt.step()
-        
-        # Step schedulers if they exist
-        if schedulers:
-            for scheduler in schedulers:
-                if scheduler is not None:
-                    scheduler.step()
-        #self.total_loss += loss
-        # Record log
         current_lr = self.trainer.optimizers[0].param_groups[0]['lr']
         self.log("train_loss", loss, prog_bar=True)
         self.log("train_loss_bbox", loss_bbox, prog_bar=True)
@@ -297,70 +308,6 @@ def lets_dance_flux(
     return hidden_states,hidden_states_bbox
 
 
-        self.total_loss =0
-        self.step = 0
-
-    def on_after_backward(self):
-        total_norm = 0.0
-        for p in self.parameters():
-            if p.grad is not None:
-                param_norm = p.grad.data.norm(2)
-                total_norm += param_norm.item() ** 2
-        total_norm = total_norm ** 0.5
-
-        # Log it to Lightning's logger (e.g., TensorBoard)
-        self.log("train/grad_l2_norm", total_norm, on_step=True, on_epoch=False, prog_bar=True, logger=True)
-    
-    def training_step(self, batch, batch_idx):
-        # Data
-        self.step +=1
-        text, image = batch["text"], batch["image"]
-
-        entity_prompts = []
-        entity_masks = []
-        for i in range(len(batch["entity_mask"][0])):
-            prompts = []
-            masks = []
-            for j in range(len(batch["entity_mask"])):
-                prompts.append(batch["entity_prompt"][j][i])
-                masks.append(batch["entity_mask"][j][i])
-            entity_prompts.append(prompts)
-            entity_masks.append(masks)
-
-        height,width = 1024,1024
-
-        self.pipe.device = self.device
-        prompt_emb_posi, prompt_emb_nega, prompt_emb_locals = self.pipe.prepare_prompts(text, local_prompts=(), masks=(), mask_scales=(), t5_sequence_length=512, negative_prompt="", cfg_scale=1.0)
-        eligen_kwargs_posi, eligen_kwargs_nega, fg_mask, bg_mask = self.pipe.prepare_eligen(prompt_emb_nega, entity_prompts, entity_masks, width, height, 512, False, False, 1.0)
-
-        if "latents" in batch:
-            latents = batch["latents"].to(dtype=self.pipe.torch_dtype, device=self.device)
-        else:
-            latents = self.pipe.vae_encoder(image.to(dtype=self.pipe.torch_dtype, device=self.device))
-
-        noise = torch.randn_like(latents)
-        timestep_id = torch.randint(0, self.pipe.scheduler.num_train_timesteps, (1,))
-        timestep = self.pipe.scheduler.timesteps[timestep_id].to(self.device)
-        extra_input = self.pipe.prepare_extra_input(latents)
-        noisy_latents = self.pipe.scheduler.add_noise(latents, noise, timestep)
-        training_target = self.pipe.scheduler.training_target(latents, noise, timestep)
-
-        # Compute loss
-        noise_pred = self.pipe.denoising_model()(
-            hidden_states=noisy_latents, timestep=timestep, **prompt_emb_posi, **extra_input, **eligen_kwargs_posi,
-            use_gradient_checkpointing=self.use_gradient_checkpointing
-        )
-
-        loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
-        loss = loss * self.pipe.scheduler.training_weight(timestep)
-        self.total_loss += loss
-        
-        # Record log
-        self.log("train_loss", self.total_loss/self.step, prog_bar=True)
-        if (self.step+1)%1000==0:
-            self.step = 0
-            self.total_loss = 0
-        return loss
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")

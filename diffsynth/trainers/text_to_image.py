@@ -7,6 +7,7 @@ from ..models.utils import load_state_dict
 from torch.nn import init
 from prodigyopt import Prodigy
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from lightning.pytorch.callbacks import ModelCheckpoint
 
 class LightningModelForT2ILoRA(pl.LightningModule):
     def __init__(
@@ -85,7 +86,7 @@ class LightningModelForT2ILoRA(pl.LightningModule):
                 # Upcast LoRA parameters into fp32
                 if param.requires_grad:
                     #print(param)
-                    param.data = param.to(torch.float32)
+                    param.data = param.to(torch.bfloat16)
             trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
             print(f"Total trainable parameters: {trainable_params}")
         except Exception as e:
@@ -93,6 +94,7 @@ class LightningModelForT2ILoRA(pl.LightningModule):
         # Lora pretrained lora weights
         if pretrained_lora_path is not None:
             state_dict = load_state_dict(pretrained_lora_path)
+            state_dict = state_dict["lora_state_dict"]
             if state_dict_converter is not None:
                 state_dict = state_dict_converter(state_dict)
             missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
@@ -132,80 +134,11 @@ class LightningModelForT2ILoRA(pl.LightningModule):
         self.log("train_loss", loss, prog_bar=True)
         return loss
 
-
-    """def configure_optimizers(self):
-        trainable_modules = filter(lambda p: p.requires_grad, self.pipe.denoising_model().parameters())
-        
-        optimizer = Prodigy(trainable_modules, lr=self.learning_rate,safeguard_warmup=True,use_bias_correction=True,weight_decay=0.01,d0=1e-6)#torch.optim.AdamW(trainable_modules, lr=self.learning_rate)
-        
-        # Total number of steps
-        total_steps = 20000#self.n_epochs * self.steps_per_epoch
-        
-        scheduler = CosineAnnealingLR(optimizer, T_max=total_steps)
-        return {
-            'optimizer': optimizer,
-            'lr_scheduler': {
-                'scheduler': scheduler,
-                'interval': 'step',  # Update the LR every step (not epoch)
-                'frequency': 1,
-            }}    
-    """
     def configure_optimizers(self):
-        # Separate LoRA and non-LoRA parameters
-        lora_params = []
-        non_lora_params = []
-        
-        for name, param in self.pipe.denoising_model().named_parameters():
-            if param.requires_grad:
-                # Check if parameter name contains 'lora' (adjust this condition based on your naming convention)
-                if 'lora' in name.lower():
-                    lora_params.append(param)
-                else:
-                    non_lora_params.append(param)
-        
-        optimizers = []
-        schedulers = []
-        
-        # Non-LoRA parameters with Prodigy optimizer and scheduler
-        if non_lora_params:
-            non_lora_optimizer = Prodigy(
-                non_lora_params, 
-                lr=self.learning_rate,
-                safeguard_warmup=True,
-                use_bias_correction=True,
-                weight_decay=0.01,
-                d0=1e-6
-            )
-            optimizers.append(non_lora_optimizer)
-            
-            # Total number of steps
-            total_steps = 20000
-            scheduler = CosineAnnealingLR(non_lora_optimizer, T_max=total_steps)
-            schedulers.append({
-                'scheduler': scheduler,
-                'interval': 'step',
-                'frequency': 1,
-            })
-        
-        # LoRA parameters with constant learning rate (using separate AdamW)
-        if lora_params:
-            lora_optimizer = Prodigy(non_lora_params, lr=self.learning_rate,safeguard_warmup=True,use_bias_correction=True,weight_decay=0.01,d0=1e-6)
-            optimizers.append(lora_optimizer)
-            
-            # Return only optimizers and schedulers that exist
-            # Don't add None schedulers when using multiple optimizers
-        
-        # Return format for multiple optimizers
-        if len(optimizers) == 1:
-            return optimizers[0], schedulers[0] if schedulers else None
-        else:
-            # For multiple optimizers, only return schedulers that are not None
-            valid_schedulers = []
-            for i, opt in enumerate(optimizers):
-                if i < len(schedulers):
-                    valid_schedulers.append(schedulers[i])
-            
-            return optimizers, valid_schedulers
+        trainable_modules = filter(lambda p: p.requires_grad, self.pipe.denoising_model().parameters())
+        optimizer = torch.optim.AdamW(trainable_modules, lr=self.learning_rate)
+        return optimizer
+    
     def on_save_checkpoint(self, checkpoint):
         checkpoint.clear()
         trainable_param_names = list(filter(lambda named_param: named_param[1].requires_grad, self.pipe.denoising_model().named_parameters()))
@@ -404,15 +337,15 @@ def launch_training_task(model, args):
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
         accelerator="gpu",
-        devices=8,
-        strategy="ddp",
+        devices="auto",
         precision=args.precision,
+        strategy="deepspeed_stage_2",
         default_root_dir=args.output_path,
         accumulate_grad_batches=args.accumulate_grad_batches,
         log_every_n_steps=10,
         callbacks=[pl.pytorch.callbacks.ModelCheckpoint(save_top_k=-1)],
         logger=logger,
-        #gradient_clip_val=1.0, gradient_clip_algorithm="norm"
+        gradient_clip_val=1.0, gradient_clip_algorithm="norm"
     )
     trainer.fit(model=model, train_dataloaders=train_loader)
 
