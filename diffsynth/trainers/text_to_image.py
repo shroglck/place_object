@@ -86,7 +86,7 @@ class LightningModelForT2ILoRA(pl.LightningModule):
                 # Upcast LoRA parameters into fp32
                 if param.requires_grad:
                     #print(param)
-                    param.data = param.to(torch.bfloat16)
+                    param.data = param.to(torch.float32)
             trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
             print(f"Total trainable parameters: {trainable_params}")
         except Exception as e:
