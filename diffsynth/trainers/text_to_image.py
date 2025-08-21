@@ -4,10 +4,8 @@ import torch, os
 from ..data.simple_text_image import TextImageDataset
 from modelscope.hub.api import HubApi
 from ..models.utils import load_state_dict
-from torch.nn import init
-from prodigyopt import Prodigy
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from lightning.pytorch.callbacks import ModelCheckpoint
+
+
 
 class LightningModelForT2ILoRA(pl.LightningModule):
     def __init__(
@@ -49,52 +47,14 @@ class LightningModelForT2ILoRA(pl.LightningModule):
             target_modules=lora_target_modules.split(","),
         )
         model = inject_adapter_in_model(lora_config, model)
-        #print(model)
-        try:
-            # Counter for stats
-            trainable_count = 0
-            total_count = 0
-            
-            # Then unfreeze and initialize parameters with the pattern in their name
-            patterns = ["bbox","_c","lora","c_"]
-            for name, param in model.named_parameters():
-                total_count += 1
-                for pattern in patterns:
-                    if pattern in name:
-                        
-                        param.requires_grad = True
-                        trainable_count += 1
-                        
-                        # Initialize the parameter if requested
-                        if True:
-                            if len(param.shape) > 1:
-                                # For weight matrices
-                                init.xavier_normal_(param)
-                            else:
-                                # For bias vectors
-                                init.zeros_(param)
-                    #else:
-                        #param.requires_grad = False
+        for param in model.parameters():
+            # Upcast LoRA parameters into fp32
+            if param.requires_grad:
+                param.data = param.to(torch.float32)
 
-            for param in model.bbox_embedder.parameters():
-                param.requires_grad = True
-
-            for param in model.final_bbox_out.parameters():
-                param.requires_grad = True
-
-            for param in model.parameters():
-                # Upcast LoRA parameters into fp32
-                if param.requires_grad:
-                    #print(param)
-                    param.data = param.to(torch.float32)
-            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            print(f"Total trainable parameters: {trainable_params}")
-        except Exception as e:
-            print()
         # Lora pretrained lora weights
         if pretrained_lora_path is not None:
             state_dict = load_state_dict(pretrained_lora_path)
-            state_dict = state_dict["lora_state_dict"]
             if state_dict_converter is not None:
                 state_dict = state_dict_converter(state_dict)
             missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
@@ -134,11 +94,13 @@ class LightningModelForT2ILoRA(pl.LightningModule):
         self.log("train_loss", loss, prog_bar=True)
         return loss
 
+
     def configure_optimizers(self):
         trainable_modules = filter(lambda p: p.requires_grad, self.pipe.denoising_model().parameters())
         optimizer = torch.optim.AdamW(trainable_modules, lr=self.learning_rate)
         return optimizer
     
+
     def on_save_checkpoint(self, checkpoint):
         checkpoint.clear()
         trainable_param_names = list(filter(lambda named_param: named_param[1].requires_grad, self.pipe.denoising_model().named_parameters()))
@@ -318,7 +280,6 @@ def launch_training_task(model, args):
         batch_size=args.batch_size,
         num_workers=args.dataloader_num_workers
     )
-
     # train
     if args.use_swanlab:
         from swanlab.integration.pytorch_lightning import SwanLabLogger
@@ -339,13 +300,11 @@ def launch_training_task(model, args):
         accelerator="gpu",
         devices="auto",
         precision=args.precision,
-        strategy="deepspeed_stage_2",
+        strategy=args.training_strategy,
         default_root_dir=args.output_path,
         accumulate_grad_batches=args.accumulate_grad_batches,
-        log_every_n_steps=10,
         callbacks=[pl.pytorch.callbacks.ModelCheckpoint(save_top_k=-1)],
         logger=logger,
-        gradient_clip_val=1.0, gradient_clip_algorithm="norm"
     )
     trainer.fit(model=model, train_dataloaders=train_loader)
 
