@@ -1,7 +1,7 @@
 import torch, os, json
 from diffsynth import load_state_dict
 from diffsynth.pipelines.flux_image_new import FluxImagePipeline, ModelConfig, ControlNetInput
-from diffsynth.trainers.utils import DiffusionTrainingModule, ImageDataset, ModelLogger, launch_training_task, flux_parser
+from diffsynth.trainers.utils import DiffusionTrainingModule, TextImageDataset, ModelLogger, launch_training_task, flux_parser
 from diffsynth.models.lora import FluxLoRAConverter
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -59,15 +59,36 @@ class FluxTrainingModule(DiffusionTrainingModule):
     def forward_preprocess(self, data):
         # CFG-sensitive parameters
         inputs_posi = {"prompt": data["prompt"]}
-        inputs_nega = {"negative_prompt": ""}
+        inputs_nega = {"negative_prompt": ["" for _ in range(len(data["prompt"]))]}
+
+        eligen_entity_masks = []
+        eligen_entity_prompts = []
+        eligen_entity_bboxes = []
+        for i in range(len(data["prompt"])):
+            eligen_entity_mask = []
+            eligen_entity_prompt = []
+            eligen_entity_bbox = []
+            for j in range(max(data["num_entities"])):
+                eligen_entity_mask.append(data["eligen_entity_masks"][i][j])
+                eligen_entity_prompt.append(data["eligen_entity_prompts"][i][j])
+                eligen_entity_bbox.append(data["eligen_entity_bboxes"][i][j])
+            eligen_entity_masks.append(eligen_entity_mask)
+            eligen_entity_prompts.append(eligen_entity_prompt)
+            eligen_entity_bboxes.append(eligen_entity_bbox)
+        
+        data["eligen_entity_masks"] = eligen_entity_masks
+        data["eligen_entity_prompts"] = eligen_entity_prompts
+        data["eligen_entity_bboxes"] = eligen_entity_bboxes
+
+        print(data["eligen_entity_prompts"])
         
         # CFG-unsensitive parameters
         inputs_shared = {
             # Assume you are using this pipeline for inference,
             # please fill in the input parameters.
             "input_image": data["image"],
-            "height": data["image"].size[1],
-            "width": data["image"].size[0],
+            "height": data["image"][0].size[1],
+            "width": data["image"][0].size[0],
             # Please do not modify the following parameters
             # unless you clearly know what this will cause.
             "cfg_scale": 1,
@@ -77,6 +98,7 @@ class FluxTrainingModule(DiffusionTrainingModule):
             "rand_device": self.pipe.device,
             "use_gradient_checkpointing": self.use_gradient_checkpointing,
             "use_gradient_checkpointing_offload": self.use_gradient_checkpointing_offload,
+            "batch_size": len(data["prompt"]),
         }
         
         # Extra inputs
@@ -106,7 +128,7 @@ class FluxTrainingModule(DiffusionTrainingModule):
 if __name__ == "__main__":
     parser = flux_parser()
     args = parser.parse_args()
-    dataset = ImageDataset(args=args)
+    dataset = TextImageDataset(dataset_base_path=args.dataset_base_path, dataset_metadata_path=args.dataset_metadata_path, steps_per_epoch=args.steps_per_epoch, height=args.height, width=args.width, center_crop=args.center_crop, random_flip=args.random_flip)
     model = FluxTrainingModule(
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,
@@ -133,4 +155,5 @@ if __name__ == "__main__":
         save_steps=args.save_steps,
         find_unused_parameters=args.find_unused_parameters,
         num_workers=args.dataset_num_workers,
+        batch_size=args.batch_size,
     )

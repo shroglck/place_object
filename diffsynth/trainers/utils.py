@@ -5,8 +5,88 @@ import pandas as pd
 from tqdm import tqdm
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
+import numpy as np
+
+class TextImageDataset(torch.utils.data.Dataset):
+    def __init__(self, dataset_base_path, dataset_metadata_path, steps_per_epoch=10000, height=1024, width=1024, center_crop=True, random_flip=False):
+        self.steps_per_epoch = steps_per_epoch
+        file_path = dataset_metadata_path
+
+        # Read the .jsonl file line by line
+        with open(file_path, "r", encoding="utf-8") as file:
+            data = [json.loads(line) for line in file]
+        
+        self.path = [os.path.join(dataset_base_path, str(file_name["image_id"]).zfill(6)+".png") for file_name in data]
+        self.text = [file["caption"] for file in data]
+        self.height = height
+        self.width = width
+        self.entity_dict = {file["image_id"]:file["entities"] for file in data }
+
+    def crop_and_resize(self, image, target_height, target_width):
+        width, height = image.size
+        scale = max(target_width / width, target_height / height)
+        image = torchvision.transforms.functional.resize(
+            image,
+            (round(height*scale), round(width*scale)),
+            interpolation=torchvision.transforms.InterpolationMode.BILINEAR
+        )
+        image = torchvision.transforms.functional.center_crop(image, (target_height, target_width))
+        return image
+    
+    
+    def get_height_width(self):
+        height, width = self.height, self.width
+        return height, width
 
 
+    def __getitem__(self, index):
+        data_id = torch.randint(0, len(self.path), (1,))[0]
+        data_id = (data_id + index) % len(self.path) # For fixed seed.
+        image_id = self.path[data_id].split("/")[-1][:-4]
+        entities = self.entity_dict[image_id]
+        text = self.text[data_id]
+
+        while len(entities)==0 :
+            data_id = torch.randint(0, len(self.path), (1,))[0]
+            data_id = (data_id + index) % len(self.path) # For fixed seed.
+            image_id = self.path[data_id].split("/")[-1][:-4]
+            entities = self.entity_dict[image_id]
+            text = self.text[data_id]
+
+
+        image = Image.open(self.path[data_id]).convert("RGB")
+        image = self.crop_and_resize(image, *self.get_height_width())
+        target_height, target_width = self.height, self.width
+        width, height = image.size
+        scale = max(target_width / width, target_height / height)
+        entity_prompts = []
+        masks = []
+        bboxes = []
+        num_entities = min(10, len(entities))
+
+        for entity in entities:
+            entity_prompts.append(entity["entity"])
+            bbox = entity['bbox']
+            mask = np.zeros((target_height,target_width,3), dtype=np.uint8)
+            mask[int(bbox[1]*target_height):int(bbox[3]*target_height),int(bbox[0]*target_width):int(bbox[2]*target_width),:] = 255
+            # Convert numpy array to PIL Image
+            mask_pil = Image.fromarray(mask, mode='RGB')
+            masks.append(mask_pil)
+            bboxes.append(np.array(bbox))
+
+        remaining  = max(0, 10-len(masks))
+        for i in range(remaining):
+            # Create empty PIL Image instead of numpy array
+            empty_mask = Image.new('RGB', (target_width, target_height), (0, 0, 0))
+            masks.append(empty_mask)
+            entity_prompts.append("<pad>")
+            bboxes.append(np.array([0,0,0,0]))
+        
+        return {"prompt": text, "image": image,"eligen_entity_masks":masks[:10],"eligen_entity_prompts":entity_prompts[:10],"eligen_entity_bboxes":bboxes[:10], "num_entities":num_entities}
+
+
+    def __len__(self):
+        return self.steps_per_epoch
 
 class ImageDataset(torch.utils.data.Dataset):
     def __init__(
@@ -423,16 +503,50 @@ def launch_training_task(
     num_epochs: int = 1,
     gradient_accumulation_steps: int = 1,
     find_unused_parameters: bool = False,
+    batch_size: int = 1,
 ):
-    dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
+    # Custom collate function to handle batching
+    def collate_fn(batch):
+        batched_data = {}
+        for key in batch[0].keys():
+            if isinstance(batch[0][key], torch.Tensor):
+                batched_data[key] = torch.stack([item[key] for item in batch])
+            else:
+                batched_data[key] = [item[key] for item in batch]
+                
+        return batched_data
+    
+    dataloader = torch.utils.data.DataLoader(
+        dataset, 
+        shuffle=True, 
+        collate_fn=collate_fn, 
+        num_workers=num_workers,
+        batch_size=batch_size
+    )
     accelerator = Accelerator(
         gradient_accumulation_steps=gradient_accumulation_steps,
         kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=find_unused_parameters)],
     )
     model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
     
+    # Initialize CSV files for real-time logging
+    os.makedirs(model_logger.output_path, exist_ok=True)
+    step_csv_path = os.path.join(model_logger.output_path, "step_loss_history.csv")
+    epoch_csv_path = os.path.join(model_logger.output_path, "epoch_loss_history.csv")
+    
+    # Create CSV headers
+    with open(step_csv_path, "w", newline="") as f:
+        f.write("step,loss\n")
+    with open(epoch_csv_path, "w", newline="") as f:
+        f.write("epoch,avg_loss\n")
+    
+    global_step = 0
+    
     for epoch_id in range(num_epochs):
-        for data in tqdm(dataloader):
+        epoch_losses = []
+        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch_id+1}/{num_epochs}")
+        
+        for step, data in enumerate(progress_bar):
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
                 loss = model(data)
@@ -440,8 +554,34 @@ def launch_training_task(
                 optimizer.step()
                 model_logger.on_step_end(accelerator, model, save_steps)
                 scheduler.step()
+                
+                # Log loss
+                loss_value = loss.item()
+                epoch_losses.append(loss_value)
+                
+                # Update step CSV in real-time
+                with open(step_csv_path, "a", newline="") as f:
+                    f.write(f"{global_step},{loss_value}\n")
+                
+                # Update progress bar with current loss
+                avg_loss = sum(epoch_losses) / len(epoch_losses)
+                progress_bar.set_postfix({
+                    'loss': f'{loss_value:.4f}',
+                    'avg_loss': f'{avg_loss:.4f}',
+                    'lr': f'{scheduler.get_last_lr()[0]:.2e}'
+                })
+                
+                global_step += 1
+        
+        # End of epoch - update epoch CSV
+        if len(epoch_losses) > 0:
+            epoch_avg_loss = sum(epoch_losses) / len(epoch_losses)
+            with open(epoch_csv_path, "a", newline="") as f:
+                f.write(f"{epoch_id},{epoch_avg_loss}\n")
+        
         if save_steps is None:
             model_logger.on_epoch_end(accelerator, model, epoch_id)
+    
     model_logger.on_training_end(accelerator, model, save_steps)
 
 
@@ -496,6 +636,9 @@ def flux_parser():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     parser.add_argument("--dataset_base_path", type=str, default="", required=True, help="Base path of the dataset.")
     parser.add_argument("--dataset_metadata_path", type=str, default=None, help="Path to the metadata file of the dataset.")
+    parser.add_argument("--steps_per_epoch", type=int, default=30000, help="Number of steps per epoch.")
+    parser.add_argument("--center_crop", type=bool, default=True, help="Whether to center crop the image.")
+    parser.add_argument("--random_flip", type=bool, default=False, help="Whether to randomly flip the image.")
     parser.add_argument("--max_pixels", type=int, default=1024*1024, help="Maximum number of pixels per frame, used for dynamic resolution..")
     parser.add_argument("--height", type=int, default=None, help="Height of images. Leave `height` and `width` empty to enable dynamic resolution.")
     parser.add_argument("--width", type=int, default=None, help="Width of images. Leave `height` and `width` empty to enable dynamic resolution.")
@@ -521,6 +664,7 @@ def flux_parser():
     parser.add_argument("--save_steps", type=int, default=None, help="Number of checkpoint saving invervals. If None, checkpoints will be saved every epoch.")
     parser.add_argument("--dataset_num_workers", type=int, default=0, help="Number of workers for data loading.")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay.")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size for training.")
     return parser
 
 

@@ -567,10 +567,10 @@ class FluxImageUnit_ShapeChecker(PipelineUnit):
 
 class FluxImageUnit_NoiseInitializer(PipelineUnit):
     def __init__(self):
-        super().__init__(input_params=("height", "width", "seed", "rand_device"))
+        super().__init__(input_params=("height", "width", "seed", "rand_device", "batch_size"))
 
-    def process(self, pipe: FluxImagePipeline, height, width, seed, rand_device):
-        noise = pipe.generate_noise((1, 16, height//8, width//8), seed=seed, rand_device=rand_device)
+    def process(self, pipe: FluxImagePipeline, height, width, seed, rand_device, batch_size):
+        noise = pipe.generate_noise((batch_size, 16, height//8, width//8), seed=seed, rand_device=rand_device)
         return {"noise": noise}
 
 
@@ -739,21 +739,30 @@ class FluxImageUnit_EntityControl(PipelineUnit):
         )
 
     def preprocess_masks(self, pipe, masks, height, width, dim):
-        out_masks = []
-        for mask in masks:
-            mask = pipe.preprocess_image(mask.resize((width, height), resample=Image.NEAREST)).mean(dim=1, keepdim=True) > 0
-            mask = mask.repeat(1, dim, 1, 1).to(device=pipe.device, dtype=pipe.torch_dtype)
-            out_masks.append(mask)
-        return out_masks
+        batch_masks = []
+        for batch_mask in masks:
+            out_masks = []
+            for mask in batch_mask:
+                mask = pipe.preprocess_image(mask.resize((width, height), resample=Image.NEAREST)).mean(dim=1, keepdim=True) > 0
+                mask = mask.repeat(1, dim, 1, 1).to(device=pipe.device, dtype=pipe.torch_dtype)
+                out_masks.append(mask)
+            out_masks = torch.cat(out_masks, dim=0).unsqueeze(0)
+            batch_masks.append(out_masks)
+        
+        return batch_masks
 
     def prepare_entity_inputs(self, pipe, entity_prompts, entity_masks, width, height, t5_sequence_length=512):
         entity_masks = self.preprocess_masks(pipe, entity_masks, height//8, width//8, 1)
-        entity_masks = torch.cat(entity_masks, dim=0).unsqueeze(0) # b, n_mask, c, h, w
+        entity_masks = torch.cat(entity_masks, dim=0) # b, n_mask, c, h, w
 
-        prompt_emb, _, _ = pipe.prompter.encode_prompt(
-            entity_prompts, device=pipe.device, t5_sequence_length=t5_sequence_length
-        )
-        return prompt_emb.unsqueeze(0), entity_masks
+        prompt_embs = []
+        for batch_prompt in entity_prompts:
+            prompt_emb, _, _ = pipe.prompter.encode_prompt(
+                batch_prompt, device=pipe.device, t5_sequence_length=t5_sequence_length
+            )
+            prompt_embs.append(prompt_emb.unsqueeze(0))
+        prompt_embs = torch.cat(prompt_embs, dim=0)
+        return prompt_embs, entity_masks
 
     def prepare_eligen(self, pipe, prompt_emb_nega, eligen_entity_prompts, eligen_entity_masks, width, height, t5_sequence_length, enable_eligen_on_negative, cfg_scale):
         entity_prompt_emb_posi, entity_masks_posi = self.prepare_entity_inputs(pipe, eligen_entity_prompts, eligen_entity_masks, width, height, t5_sequence_length)
@@ -1234,6 +1243,11 @@ def model_fn_flux_image(
     # EliGen
     if entity_prompt_emb is not None and entity_masks is not None:
         prompt_emb, image_rotary_emb, attention_mask = dit.process_entity_masks(hidden_states, prompt_emb, entity_prompt_emb, entity_masks, text_ids, image_ids, latents.shape[1])
+        for i, attn in enumerate(attention_mask):
+            binary_mask = torch.where(attn.squeeze(0) == 0, 1, 0).cpu().float().numpy().astype(np.uint8) * 255
+            img = Image.fromarray(binary_mask)
+            cuda_device = torch.cuda.current_device()
+            img.save(f"attn_{i}_{cuda_device}.png")
     else:
         prompt_emb = dit.context_embedder(prompt_emb)
         image_rotary_emb = dit.pos_embedder(torch.cat((text_ids, image_ids), dim=1))

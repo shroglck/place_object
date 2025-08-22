@@ -62,7 +62,10 @@ class BasePipeline(torch.nn.Module):
         image = torch.Tensor(np.array(image, dtype=np.float32))
         image = image.to(dtype=torch_dtype or self.torch_dtype, device=device or self.device)
         image = image * ((max_value - min_value) / 255) + min_value
-        image = repeat(image, f"H W C -> {pattern}", **({"B": 1} if "B" in pattern else {}))
+        if image.ndim == 3:
+            image = repeat(image, f"H W C -> {pattern}", **({"B": 1} if "B" in pattern else {}))
+        else:
+            image = repeat(image, f"B H W C -> {pattern}")
         return image
 
 
@@ -195,7 +198,7 @@ class ModelConfig:
             if self.local_model_path is None:
                 self.local_model_path = "./models"
             if not skip_download:
-                downloaded_files = glob.glob(self.origin_file_pattern, root_dir=os.path.join(self.local_model_path, self.model_id))
+                downloaded_files = glob.glob(os.path.join(self.local_model_path, self.model_id, self.origin_file_pattern))
                 snapshot_download(
                     self.model_id,
                     local_dir=os.path.join(self.local_model_path, self.model_id),
