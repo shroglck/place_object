@@ -72,7 +72,8 @@ def load_model_from_single_file(state_dict, model_names, model_classes, model_re
             model = model_class(**extra_kwargs)
         if hasattr(model, "eval"):
             model = model.eval()
-        model.load_state_dict(model_state_dict, assign=True)
+        model = model.to_empty(device=device)
+        model.load_state_dict(model_state_dict, assign=True, strict=False)
         model = model.to(dtype=torch_dtype, device=device)
         loaded_model_names.append(model_name)
         loaded_models.append(model)

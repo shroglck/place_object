@@ -189,12 +189,18 @@ class FluxImagePipeline(BasePipeline):
         
         inputs["latents"] = self.scheduler.add_noise(inputs["input_latents"], inputs["noise"], timestep)
         training_target = self.scheduler.training_target(inputs["input_latents"], inputs["noise"], timestep)
+
+        inputs["eligen_entity_bboxes"] = torch.tensor(inputs["eligen_entity_bboxes"]).to(dtype=self.torch_dtype, device=self.device)
+        inputs["bbox_emb"] = self.scheduler.add_noise(inputs["eligen_entity_bboxes"], inputs["noise_bbox"], timestep)
+        training_target_bbox = self.scheduler.training_target(inputs["eligen_entity_bboxes"], inputs["noise_bbox"], timestep)
         
-        noise_pred = self.model_fn(**inputs, timestep=timestep)
+        noise_pred, noise_pred_bbox = self.model_fn(**inputs, timestep=timestep)
         
-        loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
+        loss_latent = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
+        loss_bbox = torch.nn.functional.mse_loss(noise_pred_bbox.float(), training_target_bbox.float())
+        loss = loss_latent + loss_bbox
         loss = loss * self.scheduler.training_weight(timestep)
-        return loss
+        return loss, loss_latent, loss_bbox
     
     
     def _enable_vram_management_with_default_config(self, model, vram_limit):
@@ -567,11 +573,12 @@ class FluxImageUnit_ShapeChecker(PipelineUnit):
 
 class FluxImageUnit_NoiseInitializer(PipelineUnit):
     def __init__(self):
-        super().__init__(input_params=("height", "width", "seed", "rand_device", "batch_size"))
+        super().__init__(input_params=("height", "width", "seed", "rand_device", "batch_size", "eligen_entity_bboxes"))
 
-    def process(self, pipe: FluxImagePipeline, height, width, seed, rand_device, batch_size):
+    def process(self, pipe: FluxImagePipeline, height, width, seed, rand_device, batch_size, eligen_entity_bboxes):
         noise = pipe.generate_noise((batch_size, 16, height//8, width//8), seed=seed, rand_device=rand_device)
-        return {"noise": noise}
+        noise_bbox = pipe.generate_noise((batch_size, len(eligen_entity_bboxes[0]), 4), seed=seed, rand_device=rand_device)
+        return {"noise": noise, "noise_bbox": noise_bbox}
 
 
 
@@ -1121,6 +1128,7 @@ def model_fn_flux_image(
     latents=None,
     timestep=None,
     prompt_emb=None,
+    bbox_emb=None,
     pooled_prompt_emb=None,
     guidance=None,
     text_ids=None,
@@ -1218,7 +1226,9 @@ def model_fn_flux_image(
     if image_ids is None:
         image_ids = dit.prepare_image_ids(hidden_states)
     
+    bbox_emb = dit.bbox_embedder(bbox_emb)
     conditioning = dit.time_embedder(timestep, hidden_states.dtype) + dit.pooled_text_embedder(pooled_prompt_emb)
+    bbox_condtioning = dit.bbox_temb(conditioning)
     if dit.guidance_embedder is not None:
         guidance = guidance * 1000
         conditioning = conditioning + dit.guidance_embedder(guidance, hidden_states.dtype)
@@ -1239,10 +1249,11 @@ def model_fn_flux_image(
         hidden_states = torch.concat([hidden_states, step1x_reference_latents], dim=1)
         
     hidden_states = dit.x_embedder(hidden_states)
+    bbox_ids = torch.arange(bbox_emb.shape[1], device=hidden_states.device).unsqueeze(0).unsqueeze(-1).repeat(bbox_emb.shape[0],1,3)
 
     # EliGen
     if entity_prompt_emb is not None and entity_masks is not None:
-        prompt_emb, image_rotary_emb, attention_mask = dit.process_entity_masks(hidden_states, prompt_emb, entity_prompt_emb, entity_masks, text_ids, image_ids, latents.shape[1])
+        prompt_emb, image_rotary_emb, attention_mask = dit.process_entity_masks(hidden_states, prompt_emb, entity_prompt_emb, entity_masks, text_ids, image_ids, bbox_ids)
         for i, attn in enumerate(attention_mask):
             binary_mask = torch.where(attn.squeeze(0) == 0, 1, 0).cpu().float().numpy().astype(np.uint8) * 255
             img = Image.fromarray(binary_mask)
@@ -1264,13 +1275,15 @@ def model_fn_flux_image(
     else:
         # Joint Blocks
         for block_id, block in enumerate(dit.blocks):
-            hidden_states, prompt_emb = gradient_checkpoint_forward(
+            hidden_states, prompt_emb, bbox_emb = gradient_checkpoint_forward(
                 block,
                 use_gradient_checkpointing,
                 use_gradient_checkpointing_offload,
                 hidden_states,
                 prompt_emb,
+                bbox_emb,
                 conditioning,
+                bbox_condtioning,
                 image_rotary_emb,
                 attention_mask,
                 ipadapter_kwargs_list=ipadapter_kwargs_list.get(block_id, None),
@@ -1284,7 +1297,10 @@ def model_fn_flux_image(
 
         # Single Blocks
         hidden_states = torch.cat([prompt_emb, hidden_states], dim=1)
+        attention_mask = attention_mask[:, :, :hidden_states.shape[1], :hidden_states.shape[1]]
+        image_rotary_emb = image_rotary_emb[:, :, :hidden_states.shape[1]]
         num_joint_blocks = len(dit.blocks)
+
         for block_id, block in enumerate(dit.single_blocks):
             hidden_states, prompt_emb = gradient_checkpoint_forward(
                 block,
@@ -1310,6 +1326,7 @@ def model_fn_flux_image(
 
     hidden_states = dit.final_norm_out(hidden_states, conditioning)
     hidden_states = dit.final_proj_out(hidden_states)
+    hidden_states_bbox = dit.final_bbox_out(bbox_emb)
     
     # Step1x
     if step1x_reference_latents is not None:
@@ -1321,4 +1338,4 @@ def model_fn_flux_image(
 
     hidden_states = dit.unpatchify(hidden_states, height, width)
 
-    return hidden_states
+    return hidden_states, hidden_states_bbox

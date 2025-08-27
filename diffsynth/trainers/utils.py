@@ -536,20 +536,22 @@ def launch_training_task(
     
     # Create CSV headers
     with open(step_csv_path, "w", newline="") as f:
-        f.write("step,loss\n")
+        f.write("step,loss,loss_latent,loss_bbox\n")
     with open(epoch_csv_path, "w", newline="") as f:
-        f.write("epoch,avg_loss\n")
+        f.write("epoch,avg_loss,avg_loss_latent,avg_loss_bbox\n")
     
     global_step = 0
     
     for epoch_id in range(num_epochs):
         epoch_losses = []
+        epoch_loss_latents = []
+        epoch_loss_bboxes = []
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch_id+1}/{num_epochs}")
         
         for step, data in enumerate(progress_bar):
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
-                loss = model(data)
+                loss, loss_latent, loss_bbox = model(data)
                 accelerator.backward(loss)
                 optimizer.step()
                 model_logger.on_step_end(accelerator, model, save_steps)
@@ -558,16 +560,22 @@ def launch_training_task(
                 # Log loss
                 loss_value = loss.item()
                 epoch_losses.append(loss_value)
-                
+                epoch_loss_latents.append(loss_latent.item())
+                epoch_loss_bboxes.append(loss_bbox.item())
+
                 # Update step CSV in real-time
                 with open(step_csv_path, "a", newline="") as f:
-                    f.write(f"{global_step},{loss_value}\n")
+                    f.write(f"{global_step},{loss_value},{loss_latent.item()},{loss_bbox.item()}\n")
                 
                 # Update progress bar with current loss
                 avg_loss = sum(epoch_losses) / len(epoch_losses)
+                epoch_avg_loss_latent = sum(epoch_loss_latents) / len(epoch_loss_latents)
+                epoch_avg_loss_bbox = sum(epoch_loss_bboxes) / len(epoch_loss_bboxes)
                 progress_bar.set_postfix({
                     'loss': f'{loss_value:.4f}',
                     'avg_loss': f'{avg_loss:.4f}',
+                    'loss_latent': f'{loss_latent.item():.4f}',
+                    'loss_bbox': f'{loss_bbox.item():.4f}',
                     'lr': f'{scheduler.get_last_lr()[0]:.2e}'
                 })
                 
@@ -577,7 +585,7 @@ def launch_training_task(
         if len(epoch_losses) > 0:
             epoch_avg_loss = sum(epoch_losses) / len(epoch_losses)
             with open(epoch_csv_path, "a", newline="") as f:
-                f.write(f"{epoch_id},{epoch_avg_loss}\n")
+                f.write(f"{epoch_id},{epoch_avg_loss},{epoch_avg_loss_latent},{epoch_avg_loss_bbox}\n")
         
         if save_steps is None:
             model_logger.on_epoch_end(accelerator, model, epoch_id)
@@ -654,6 +662,7 @@ def flux_parser():
     parser.add_argument("--lora_base_model", type=str, default=None, help="Which model LoRA is added to.")
     parser.add_argument("--lora_target_modules", type=str, default="q,k,v,o,ffn.0,ffn.2", help="Which layers LoRA is added to.")
     parser.add_argument("--lora_rank", type=int, default=32, help="Rank of LoRA.")
+    parser.add_argument("--lora_alpha", type=int, default=None, help="Alpha of LoRA.")
     parser.add_argument("--lora_checkpoint", type=str, default=None, help="Path to the LoRA checkpoint. If provided, LoRA will be loaded from this checkpoint.")
     parser.add_argument("--extra_inputs", default=None, help="Additional model inputs, comma-separated.")
     parser.add_argument("--align_to_opensource_format", default=False, action="store_true", help="Whether to align the lora format to opensource format. Only for DiT's LoRA.")

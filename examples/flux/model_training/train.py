@@ -1,8 +1,9 @@
-import torch, os, json
+import torch, os, json, numpy as np
 from diffsynth import load_state_dict
 from diffsynth.pipelines.flux_image_new import FluxImagePipeline, ModelConfig, ControlNetInput
 from diffsynth.trainers.utils import DiffusionTrainingModule, TextImageDataset, ModelLogger, launch_training_task, flux_parser
 from diffsynth.models.lora import FluxLoRAConverter
+from torch.nn import init
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
@@ -16,6 +17,7 @@ class FluxTrainingModule(DiffusionTrainingModule):
         use_gradient_checkpointing=True,
         use_gradient_checkpointing_offload=False,
         extra_inputs=None,
+        lora_alpha=None,
     ):
         super().__init__()
         # Load models
@@ -39,7 +41,8 @@ class FluxTrainingModule(DiffusionTrainingModule):
             model = self.add_lora_to_model(
                 getattr(self.pipe, lora_base_model),
                 target_modules=lora_target_modules.split(","),
-                lora_rank=lora_rank
+                lora_rank=lora_rank,
+                lora_alpha=lora_alpha
             )
             if lora_checkpoint is not None:
                 state_dict = load_state_dict(lora_checkpoint)
@@ -49,6 +52,37 @@ class FluxTrainingModule(DiffusionTrainingModule):
                 if len(load_result[1]) > 0:
                     print(f"Warning, LoRA key mismatch! Unexpected keys in LoRA checkpoint: {load_result[1]}")
             setattr(self.pipe, lora_base_model, model)
+
+        # Counter for stats
+        trainable_count = 0
+        total_count = 0
+        
+        # Then unfreeze and initialize parameters with the pattern in their name
+        patterns = ["bbox","_c","lora","c_"]
+        for name, param in self.pipe.dit.named_parameters():
+            total_count += 1
+            for pattern in patterns:
+                if pattern in name:
+                    param.requires_grad = True
+                    trainable_count += 1
+                    
+                    # Initialize the parameter if requested
+                    if True:
+                        if len(param.shape) > 1:
+                            # For weight matrices
+                            init.xavier_normal_(param)
+                        else:
+                            # For bias vectors
+                            init.zeros_(param)
+
+        for param in self.pipe.dit.bbox_embedder.parameters():
+            param.requires_grad = True
+
+        for param in self.pipe.dit.final_bbox_out.parameters():
+            param.requires_grad = True
+        
+        trainable_params = sum(p.numel() for p in self.pipe.dit.parameters() if p.requires_grad)
+        print(f"Total trainable parameters: {trainable_params}")
             
         # Store other configs
         self.use_gradient_checkpointing = use_gradient_checkpointing
@@ -78,9 +112,8 @@ class FluxTrainingModule(DiffusionTrainingModule):
         
         data["eligen_entity_masks"] = eligen_entity_masks
         data["eligen_entity_prompts"] = eligen_entity_prompts
-        data["eligen_entity_bboxes"] = eligen_entity_bboxes
-
-        print(data["eligen_entity_prompts"])
+        data["eligen_entity_bboxes"] = np.array(eligen_entity_bboxes)
+        data["eligen_entity_bboxes"] = 2 * data["eligen_entity_bboxes"] - 1
         
         # CFG-unsensitive parameters
         inputs_shared = {
@@ -99,6 +132,7 @@ class FluxTrainingModule(DiffusionTrainingModule):
             "use_gradient_checkpointing": self.use_gradient_checkpointing,
             "use_gradient_checkpointing_offload": self.use_gradient_checkpointing_offload,
             "batch_size": len(data["prompt"]),
+            "eligen_entity_bboxes": data["eligen_entity_bboxes"],
         }
         
         # Extra inputs
@@ -120,8 +154,8 @@ class FluxTrainingModule(DiffusionTrainingModule):
     def forward(self, data, inputs=None):
         if inputs is None: inputs = self.forward_preprocess(data)
         models = {name: getattr(self.pipe, name) for name in self.pipe.in_iteration_models}
-        loss = self.pipe.training_loss(**models, **inputs)
-        return loss
+        loss, loss_latent, loss_bbox = self.pipe.training_loss(**models, **inputs)
+        return loss, loss_latent, loss_bbox
 
 
 
@@ -140,6 +174,7 @@ if __name__ == "__main__":
         use_gradient_checkpointing=args.use_gradient_checkpointing,
         use_gradient_checkpointing_offload=args.use_gradient_checkpointing_offload,
         extra_inputs=args.extra_inputs,
+        lora_alpha=args.lora_alpha,
     )
     model_logger = ModelLogger(
         args.output_path,
