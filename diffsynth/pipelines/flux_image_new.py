@@ -1269,7 +1269,7 @@ def model_fn_flux_image(
         #     img.save(f"attn_{i}_{cuda_device}.png")
     else:
         prompt_emb = dit.context_embedder(prompt_emb)
-        image_rotary_emb = dit.pos_embedder(torch.cat((text_ids, image_ids), dim=1))
+        image_rotary_emb = dit.pos_embedder(torch.cat((text_ids, image_ids, bbox_ids), dim=1))
         attention_mask = None
 
     # TeaCache
@@ -1305,7 +1305,8 @@ def model_fn_flux_image(
 
         # Single Blocks
         hidden_states = torch.cat([prompt_emb, hidden_states], dim=1)
-        attention_mask = attention_mask[:, :, :hidden_states.shape[1], :hidden_states.shape[1]]
+        if attention_mask is not None:
+            attention_mask = attention_mask[:, :, :hidden_states.shape[1], :hidden_states.shape[1]]
         image_rotary_emb = image_rotary_emb[:, :, :hidden_states.shape[1]]
         num_joint_blocks = len(dit.blocks)
 

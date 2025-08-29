@@ -114,7 +114,7 @@ def example(pipe, seeds, example_id, global_prompt, entity_prompts):
         # generate image
         image, bbox = pipe(
             prompt=global_prompt,
-            cfg_scale=1.0,
+            cfg_scale=3.0,
             negative_prompt=negative_prompt,
             num_inference_steps=50,
             embedded_guidance=3.5,
@@ -123,7 +123,7 @@ def example(pipe, seeds, example_id, global_prompt, entity_prompts):
             width=1024,
             eligen_entity_prompts=entity_prompts,
             eligen_entity_masks=masks,
-            eligen_enable_on_negative=True,
+            # eligen_enable_on_negative=True,
         )
         image.save(f"eligen_example_{example_id}_{seed}.png")
         visualize_masks(image, masks[0], entity_prompts[0], f"eligen_example_{example_id}_mask_{seed}.png")
