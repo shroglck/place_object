@@ -58,7 +58,7 @@ def main(lora_rank: int):
     pipe.to(device)
     pipe.device = device
 
-    save_root = f"/mnt/sphere/ddivyansh-shared/ControlImageGen/baseline/layoutSAM-eval-Ours-FLUX-lora{lora_rank}"
+    save_root = f"/mnt/sphere/ddivyansh-shared/ControlImageGen/layoutSAM-eval-Ours-FLUX-lora{lora_rank}Test2"
     img_save_root = os.path.join(save_root, "images")
     os.makedirs(img_save_root, exist_ok=True)
     img_with_layout_save_root = os.path.join(save_root, "images_with_layout")
@@ -94,7 +94,7 @@ def main(lora_rank: int):
                 width=target_width,
                 eligen_entity_prompts=region_caption_list,
                 eligen_entity_masks=masks,
-                eligen_enable_on_negative=True,
+                # eligen_enable_on_negative=True,
             )
             image.save(image_path)
             
