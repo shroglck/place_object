@@ -4,12 +4,13 @@ from torch.utils.data import DataLoader
 from PIL import Image
 from datasets import load_dataset
 from layoutsam.dataset.layoutsam_benchmark import BboxDataset
-from diffsynth import ModelManager, FluxImagePipeline
+from diffsynth.pipelines.flux_image_new import FluxImagePipeline, ModelConfig
 from layoutsam.utils.bbox_visualization import bbox_visualization,scale_boxes
 import numpy as np
 from accelerate import Accelerator
 from accelerate.utils.tqdm import tqdm
 import argparse
+from safetensors import safe_open
 
 def main(lora_rank: int):
     accelerator = Accelerator()
@@ -21,13 +22,39 @@ def main(lora_rank: int):
     test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=1)
     test_dataloader = accelerator.prepare(test_dataloader)
 
-    model_manager = ModelManager(torch_dtype=torch.bfloat16, device="cpu", model_id_list=["FLUX.1-dev"])
-    lora_path = f"/mnt/sphere/ddivyansh-shared/ControlImageGen/models/lr_{lora_rank}_one_step/rank_{lora_rank}.ckpt"
-    print(f"Loading LoRA model from {lora_path} with rank {lora_rank}")
-    model_manager.load_lora(lora_path, lora_alpha=1)
-    pipe = FluxImagePipeline.from_model_manager(model_manager)
-    weights_dict = torch.load(lora_path, map_location='cpu')  # Load to CPU first for memory efficiency
-    pipe.dit.load_state_dict(weights_dict, strict=False)
+    pipe = FluxImagePipeline.from_pretrained(
+        torch_dtype=torch.bfloat16,
+        device=device,
+        model_configs=[
+            ModelConfig(model_id="black-forest-labs/FLUX.1-dev", origin_file_pattern="flux1-dev.safetensors"),
+            ModelConfig(model_id="black-forest-labs/FLUX.1-dev", origin_file_pattern="text_encoder/model.safetensors"),
+            ModelConfig(model_id="black-forest-labs/FLUX.1-dev", origin_file_pattern="text_encoder_2/"),
+            ModelConfig(model_id="black-forest-labs/FLUX.1-dev", origin_file_pattern="ae.safetensors"),
+        ],
+    )
+
+    LORA_path = "/mnt/sphere/nvme-backups/luogeng/shivansh/Temp2/Diffsynth/models/train/FLUX.1-dev-EliGen_lora/step-10000.safetensors"
+    lora_state_dict = dict()
+    bbox_state_dict = dict()
+
+    with safe_open(LORA_path, framework="pt") as f:
+        for key in f.keys():
+            if "bbox" in key or "_c" in key or "c_" in key:
+                bbox_state_dict[key] = f.get_tensor(key)
+            else:
+                lora_state_dict[key] = f.get_tensor(key)
+
+    print("lora_state_dict keys: ", len(lora_state_dict))
+    print("bbox_state_dict keys: ", len(bbox_state_dict))
+
+    # Load bbox state dict into pipe.dit
+    missing_keys, unexpected_keys = pipe.dit.load_state_dict(bbox_state_dict, strict=False)
+        
+    print(f"Bbox unexpected keys: {len(unexpected_keys)}")
+    if unexpected_keys:
+        print(f"Bbox unexpected keys: {unexpected_keys[:5]}...")
+
+    pipe.load_lora(pipe.dit, state_dict=lora_state_dict, alpha=1)
     pipe.to(device)
     pipe.device = device
 
@@ -37,47 +64,44 @@ def main(lora_rank: int):
     img_with_layout_save_root = os.path.join(save_root, "images_with_layout")
     os.makedirs(img_with_layout_save_root, exist_ok=True)
 
-    negative_prompt = "worst quality, low quality, monochrome, zombie, interlocked fingers, Aissist, cleavage, nsfw,"
+    negative_prompt = ["worst quality, low quality, monochrome, zombie, interlocked fingers, Aissist, cleavage, nsfw,"]
     for i, batch in enumerate(tqdm(test_dataloader)):
         global_caption = batch["global_caption"]
-        region_caption_list = [t[0] for t in batch["detail_region_caption_list"]]
+        region_caption_list = [[t[0] for t in batch["detail_region_caption_list"]]]
         region_bboxes_list = batch["region_bboxes_list"][0]
         filename = batch["file_name"][0]
         
         target_height, target_width = 1024, 1024
         masks = []
         image_path = f"{img_save_root}/{filename}"
-        # if os.path.exists(image_path):
-        #     print(f"Image {image_path} already exists, skipping...")
-        #     continue
         with torch.no_grad():
             bboxes = [box.unsqueeze(0).to(device) for box in region_bboxes_list]
             for bbox in bboxes:
                 mask = np.zeros((target_height, target_width, 3))
                 mask[int(bbox[0][1]*target_height):int(bbox[0][3]*target_height), int(bbox[0][0]*target_width):int(bbox[0][2]*target_width), :] = 255.0
                 masks.append(Image.fromarray(mask.astype(np.uint8)))
-            image = pipe(
-                input_image = None,
+
+            masks = [masks]
+
+            image, bbox = pipe(
                 prompt=global_caption,
                 cfg_scale=3.0,
                 negative_prompt=negative_prompt,
                 num_inference_steps=50,
                 embedded_guidance=3.5,
                 seed=0,
-                bbox=bboxes,
                 height=target_height,
                 width=target_width,
                 eligen_entity_prompts=region_caption_list,
                 eligen_entity_masks=masks,
-                local_prompts=region_caption_list
+                eligen_enable_on_negative=True,
             )
             image.save(image_path)
-            
             
             img_with_layout_save_name=os.path.join(img_with_layout_save_root, filename)
 
             white_image = Image.new('RGB', (target_width, target_height), color='rgb(256,256,256)')
-            show_input = {"boxes":scale_boxes(region_bboxes_list, target_width, target_height),"labels":region_caption_list}
+            show_input = {"boxes":scale_boxes(region_bboxes_list, target_width, target_height),"labels":region_caption_list[0]}
 
             bbox_visualization_img = bbox_visualization(white_image,show_input)
             image_with_bbox = bbox_visualization(image ,show_input)

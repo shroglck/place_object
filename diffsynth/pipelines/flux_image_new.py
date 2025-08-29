@@ -440,13 +440,13 @@ class FluxImagePipeline(BasePipeline):
     def __call__(
         self,
         # Prompt
-        prompt: str,
-        negative_prompt: str = "",
+        prompt: list[str],
+        negative_prompt: list[str] = [""],
         cfg_scale: float = 1.0,
         embedded_guidance: float = 3.5,
         t5_sequence_length: int = 512,
         # Image
-        input_image: Image.Image = None,
+        input_image: list[Image.Image] = None,
         denoising_strength: float = 1.0,
         # Shape
         height: int = 1024,
@@ -470,8 +470,9 @@ class FluxImagePipeline(BasePipeline):
         ipadapter_images: Union[list[Image.Image], Image.Image] = None,
         ipadapter_scale: float = 1.0,
         # EliGen
-        eligen_entity_prompts: list[str] = None,
-        eligen_entity_masks: list[Image.Image] = None,
+        eligen_entity_prompts: list[list[str]] = None,
+        eligen_entity_masks: list[list[Image.Image]] = None,
+        eligen_entity_bboxes: list[list[list[float]]] = None,
         eligen_enable_on_negative: bool = False,
         eligen_enable_inpaint: bool = False,
         # InfiniteYou
@@ -520,7 +521,7 @@ class FluxImagePipeline(BasePipeline):
             "kontext_images": kontext_images,
             "controlnet_inputs": controlnet_inputs,
             "ipadapter_images": ipadapter_images, "ipadapter_scale": ipadapter_scale,
-            "eligen_entity_prompts": eligen_entity_prompts, "eligen_entity_masks": eligen_entity_masks, "eligen_enable_on_negative": eligen_enable_on_negative, "eligen_enable_inpaint": eligen_enable_inpaint,
+            "eligen_entity_prompts": eligen_entity_prompts, "eligen_entity_masks": eligen_entity_masks, "eligen_enable_on_negative": eligen_enable_on_negative, "eligen_enable_inpaint": eligen_enable_inpaint, "eligen_entity_bboxes": eligen_entity_bboxes,
             "infinityou_id_image": infinityou_id_image, "infinityou_guidance": infinityou_guidance,
             "flex_inpaint_image": flex_inpaint_image, "flex_inpaint_mask": flex_inpaint_mask, "flex_control_image": flex_control_image, "flex_control_strength": flex_control_strength, "flex_control_stop": flex_control_stop,
             "value_controller_inputs": value_controller_inputs,
@@ -530,9 +531,12 @@ class FluxImagePipeline(BasePipeline):
             "tea_cache_l1_thresh": tea_cache_l1_thresh,
             "tiled": tiled, "tile_size": tile_size, "tile_stride": tile_stride,
             "progress_bar_cmd": progress_bar_cmd,
+            "batch_size": len(prompt),
         }
         for unit in self.units:
             inputs_shared, inputs_posi, inputs_nega = self.unit_runner(unit, self, inputs_shared, inputs_posi, inputs_nega)
+
+        inputs_shared["bbox_emb"] = inputs_shared["noise_bbox"]
 
         # Denoise
         self.load_models_to_device(self.in_iteration_models)
@@ -541,23 +545,27 @@ class FluxImagePipeline(BasePipeline):
             timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
 
             # Inference
-            noise_pred_posi = self.model_fn(**models, **inputs_shared, **inputs_posi, timestep=timestep, progress_id=progress_id)
+            noise_pred_posi, bbox_noise_pred_posi = self.model_fn(**models, **inputs_shared, **inputs_posi, timestep=timestep, progress_id=progress_id)
             if cfg_scale != 1.0:
-                noise_pred_nega = self.model_fn(**models, **inputs_shared, **inputs_nega, timestep=timestep, progress_id=progress_id)
+                noise_pred_nega, bbox_noise_pred_nega = self.model_fn(**models, **inputs_shared, **inputs_nega, timestep=timestep, progress_id=progress_id)
                 noise_pred = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
+                bbox_noise_pred = bbox_noise_pred_nega + cfg_scale * (bbox_noise_pred_posi - bbox_noise_pred_nega)
             else:
                 noise_pred = noise_pred_posi
+                bbox_noise_pred = bbox_noise_pred_posi
 
             # Scheduler
             inputs_shared["latents"] = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], inputs_shared["latents"])
+            inputs_shared["bbox_emb"] = self.scheduler.step(bbox_noise_pred, self.scheduler.timesteps[progress_id], inputs_shared["bbox_emb"])
         
         # Decode
         self.load_models_to_device(['vae_decoder'])
         image = self.vae_decoder(inputs_shared["latents"], device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         image = self.vae_output_to_image(image)
         self.load_models_to_device([])
+        bbox = inputs_shared["bbox_emb"]
 
-        return image
+        return image, bbox
 
 
 
@@ -573,11 +581,11 @@ class FluxImageUnit_ShapeChecker(PipelineUnit):
 
 class FluxImageUnit_NoiseInitializer(PipelineUnit):
     def __init__(self):
-        super().__init__(input_params=("height", "width", "seed", "rand_device", "batch_size", "eligen_entity_bboxes"))
+        super().__init__(input_params=("height", "width", "seed", "rand_device", "batch_size", "eligen_entity_prompts"))
 
-    def process(self, pipe: FluxImagePipeline, height, width, seed, rand_device, batch_size, eligen_entity_bboxes):
+    def process(self, pipe: FluxImagePipeline, height, width, seed, rand_device, batch_size, eligen_entity_prompts):
         noise = pipe.generate_noise((batch_size, 16, height//8, width//8), seed=seed, rand_device=rand_device)
-        noise_bbox = pipe.generate_noise((batch_size, len(eligen_entity_bboxes[0]), 4), seed=seed, rand_device=rand_device)
+        noise_bbox = pipe.generate_noise((batch_size, len(eligen_entity_prompts[0]), 4), seed=seed, rand_device=rand_device)
         return {"noise": noise, "noise_bbox": noise_bbox}
 
 
@@ -1254,11 +1262,11 @@ def model_fn_flux_image(
     # EliGen
     if entity_prompt_emb is not None and entity_masks is not None:
         prompt_emb, image_rotary_emb, attention_mask = dit.process_entity_masks(hidden_states, prompt_emb, entity_prompt_emb, entity_masks, text_ids, image_ids, bbox_ids)
-        for i, attn in enumerate(attention_mask):
-            binary_mask = torch.where(attn.squeeze(0) == 0, 1, 0).cpu().float().numpy().astype(np.uint8) * 255
-            img = Image.fromarray(binary_mask)
-            cuda_device = torch.cuda.current_device()
-            img.save(f"attn_{i}_{cuda_device}.png")
+        # for i, attn in enumerate(attention_mask):
+        #     binary_mask = torch.where(attn.squeeze(0) == 0, 1, 0).cpu().float().numpy().astype(np.uint8) * 255
+        #     img = Image.fromarray(binary_mask)
+        #     cuda_device = torch.cuda.current_device()
+        #     img.save(f"attn_{i}_{cuda_device}.png")
     else:
         prompt_emb = dit.context_embedder(prompt_emb)
         image_rotary_emb = dit.pos_embedder(torch.cat((text_ids, image_ids), dim=1))
