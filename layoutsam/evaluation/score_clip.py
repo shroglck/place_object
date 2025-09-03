@@ -31,7 +31,7 @@ if __name__ == "__main__":
     test_dataset = BboxDataset(test_dataset)
     test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=1)
 
-    generate_path = "/mnt/sphere/ddivyansh-shared/ControlImageGen/baseline/layoutSAM-eval-SiamLayout-SD3-lora/images"   
+    generate_path = "/mnt/sphere/ddivyansh-shared/ControlImageGen/layoutSAM-eval-Ours-FLUX-lora16Test/images"   
     print("processing:", generate_path)
     save_path = generate_path.replace("images", "clip.txt")
     
@@ -47,6 +47,9 @@ if __name__ == "__main__":
         global_caption = batch["global_caption"][0]
         filename = batch["file_name"][0]
         generated_img = os.path.join(generate_path, filename)
+        if not os.path.exists(generated_img):
+            print(f"Image {generated_img} does not exist")
+            continue
         similarity = clip_metric(Image.open(generated_img).convert("RGB"), caption_list=[global_caption])[0]
         clip_scores.append(similarity.item())
         

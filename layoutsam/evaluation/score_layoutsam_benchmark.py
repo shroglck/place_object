@@ -20,7 +20,7 @@ if __name__ == "__main__":
     test_dataset = BboxDataset(test_dataset)
     test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=1)
 
-    generate_path = "/mnt/sphere/ddivyansh-shared/ControlImageGen/baseline/layoutSAM-eval/images"   
+    generate_path = "/mnt/sphere/ddivyansh-shared/ControlImageGen/layoutSAM-eval-Baseline-FLUX/images"   
     print("processing:",generate_path)
 
     save_json_path = generate_path.replace("images", "minicpm-vqa.json")
@@ -38,6 +38,9 @@ if __name__ == "__main__":
         filename = batch["file_name"][0]
 
         generated_img = os.path.join(generate_path,filename)
+        if not os.path.exists(generated_img):
+            print(f"Image {generated_img} does not exist")
+            continue
         temp_save_root = os.path.join(temp_root, filename.replace('.jpg', ''))
         os.makedirs(temp_save_root, exist_ok=True)
 

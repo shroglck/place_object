@@ -58,7 +58,7 @@ def main(lora_rank: int):
     pipe.to(device)
     pipe.device = device
 
-    save_root = f"/mnt/sphere/ddivyansh-shared/ControlImageGen/layoutSAM-eval-Ours-FLUX-lora{lora_rank}Test2"
+    save_root = f"/mnt/sphere/ddivyansh-shared/ControlImageGen/layoutSAM-eval-Ours-FLUX-lora{lora_rank}Test"
     img_save_root = os.path.join(save_root, "images")
     os.makedirs(img_save_root, exist_ok=True)
     img_with_layout_save_root = os.path.join(save_root, "images_with_layout")
@@ -85,7 +85,7 @@ def main(lora_rank: int):
 
             image, bbox = pipe(
                 prompt=global_caption,
-                cfg_scale=3.0,
+                cfg_scale=1.0,
                 negative_prompt=negative_prompt,
                 num_inference_steps=50,
                 embedded_guidance=3.5,
