@@ -5,15 +5,15 @@
 ### `flux_image_new.py`
 **Purpose**: Main pipeline implementation for FLUX image generation with entity control
 - **Core Pipeline**: `FluxImagePipeline` - The main pipeline class that orchestrates the entire generation process
-- **Entity Control**: Implements EliGen (Entity-aware Localized Generation) for precise control over object placement and attributes
+- **Entity Control**: Implements EliGen (Entity-aware Localized Generation)
 - **Training Loss**: Implements joint training loss for both latent space and bounding box predictions
-- **Multi-Modal Support**: Handles text, image, and bounding box inputs for entity-aware generation
+- **MultiModal Support**: Handles text, image, and bounding box inputs
 
 ### `flux_dit.py`
 **Purpose**: Core DiT (Diffusion Transformer) model implementation
 - **Architecture**: Implements the FluxDiT model with joint and single transformer blocks
 - **Entity Processing**: Handles entity masks and prompts for localized attention
-- **Bounding Box Integration**: Fourier-based embedding system for spatial coordinates
+- **Bounding Box Integration**: Fourier based embedding system for spatial coordinates
 
 ### `train.py`
 **Purpose**: Main training script for FLUX models with entity control
