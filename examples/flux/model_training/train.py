@@ -4,6 +4,7 @@ from diffsynth.pipelines.flux_image_new import FluxImagePipeline, ModelConfig, C
 from diffsynth.trainers.utils import DiffusionTrainingModule, TextImageDataset, ModelLogger, launch_training_task, flux_parser
 from diffsynth.models.lora import FluxLoRAConverter
 from torch.nn import init
+from safetensors import safe_open
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
@@ -18,6 +19,7 @@ class FluxTrainingModule(DiffusionTrainingModule):
         use_gradient_checkpointing_offload=False,
         extra_inputs=None,
         lora_alpha=None,
+        stage_one_checkpoint=None,
     ):
         super().__init__()
         # Load models
@@ -44,27 +46,14 @@ class FluxTrainingModule(DiffusionTrainingModule):
                 lora_rank=lora_rank,
                 lora_alpha=lora_alpha
             )
-            if lora_checkpoint is not None:
-                state_dict = load_state_dict(lora_checkpoint)
-                state_dict = self.mapping_lora_state_dict(state_dict)
-                load_result = model.load_state_dict(state_dict, strict=False)
-                print(f"LoRA checkpoint loaded: {lora_checkpoint}, total {len(state_dict)} keys")
-                if len(load_result[1]) > 0:
-                    print(f"Warning, LoRA key mismatch! Unexpected keys in LoRA checkpoint: {load_result[1]}")
             setattr(self.pipe, lora_base_model, model)
-
-        # Counter for stats
-        trainable_count = 0
-        total_count = 0
         
         # Then unfreeze and initialize parameters with the pattern in their name
         patterns = ["bbox","_c","lora","c_"]
         for name, param in self.pipe.dit.named_parameters():
-            total_count += 1
             for pattern in patterns:
                 if pattern in name:
                     param.requires_grad = True
-                    trainable_count += 1
                     
                     # Initialize the parameter if requested
                     if True:
@@ -80,6 +69,30 @@ class FluxTrainingModule(DiffusionTrainingModule):
 
         for param in self.pipe.dit.final_bbox_out.parameters():
             param.requires_grad = True
+
+        if lora_checkpoint is not None:
+            state_dict = load_state_dict(lora_checkpoint)
+            state_dict = self.mapping_lora_state_dict(state_dict)
+            load_result = model.load_state_dict(state_dict, strict=False)
+            print(f"LoRA checkpoint loaded: {lora_checkpoint}, total {len(state_dict)} keys")
+            if len(load_result[1]) > 0:
+                print(f"Warning, LoRA key mismatch! Unexpected keys in LoRA checkpoint: {load_result[1]}")
+
+        if stage_one_checkpoint is not None:
+            state_dict = dict()
+
+            with safe_open(stage_one_checkpoint, framework="pt") as f:
+                for key in f.keys():
+                    state_dict[key] = f.get_tensor(key)
+
+            missing, unexpected = self.pipe.dit.load_state_dict(state_dict, strict=False)
+            print(f"Stage One checkpoint loaded: {stage_one_checkpoint}, total {len(state_dict)} keys")
+            if len(unexpected) > 0:
+                print(f"Warning, Bbox key mismatch! Unexpected keys in Stage One checkpoint: {unexpected}")
+
+        for name, param in self.pipe.dit.named_parameters():
+            if param.requires_grad:
+                param.data = param.to(torch.float32)
         
         trainable_params = sum(p.numel() for p in self.pipe.dit.parameters() if p.requires_grad)
         print(f"Total trainable parameters: {trainable_params}")
@@ -125,7 +138,7 @@ class FluxTrainingModule(DiffusionTrainingModule):
             # Please do not modify the following parameters
             # unless you clearly know what this will cause.
             "cfg_scale": 1,
-            "embedded_guidance": 1,
+            "embedded_guidance": 3.5,
             "t5_sequence_length": 512,
             "tiled": False,
             "rand_device": self.pipe.device,
@@ -175,13 +188,35 @@ if __name__ == "__main__":
         use_gradient_checkpointing_offload=args.use_gradient_checkpointing_offload,
         extra_inputs=args.extra_inputs,
         lora_alpha=args.lora_alpha,
+        stage_one_checkpoint=args.stage_one_checkpoint,
     )
     model_logger = ModelLogger(
         args.output_path,
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
         state_dict_converter=FluxLoRAConverter.align_to_opensource_format if args.align_to_opensource_format else lambda x:x,
     )
-    optimizer = torch.optim.AdamW(model.trainable_modules(), lr=args.learning_rate, weight_decay=args.weight_decay)
+
+    if args.stage_one:
+        optimizer = torch.optim.AdamW(model.trainable_modules(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    else:
+        named_params = list(model.pipe.dit.named_parameters())
+        trainable = [(n, p) for n, p in named_params if p.requires_grad]
+
+        # BBox: contains "bbox", "_c", or "c_"
+        bbox_names = {n for n, _ in trainable if ("bbox" in n) or ("_c" in n) or ("c_" in n)}
+        bbox_params = [p for n, p in trainable if n in bbox_names]
+
+        # LoRA: everything else that is trainable
+        lora_params = [p for n, p in trainable if n not in bbox_names]
+
+        print(f"bbox params: {len(bbox_params)}, lora params: {len(lora_params)}")
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": bbox_params, "lr": 1e-5, "weight_decay": args.weight_decay},
+                {"params": lora_params, "lr": 1e-4, "weight_decay": args.weight_decay},
+            ]
+        )
+    
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
     launch_training_task(
         dataset, model, model_logger, optimizer, scheduler,

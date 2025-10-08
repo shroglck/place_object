@@ -57,7 +57,10 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --main_process_port 35664 example
   --lora_alpha 4 \
   --use_gradient_checkpointing \
   --gradient_accumulation_steps 4 \
-  --save_steps 800
+  --save_steps 800 \
+  --reflow_loss False \
+  --stage_one False \
+  --stage_one_checkpoint None
 ```
 
 ### Command Parameters Explained
@@ -71,7 +74,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --main_process_port 35664 example
 - **`--height/width 1024`**: Fixed image resolution for training
 - **`--dataset_repeat 50`**: Repeats the dataset 50 times per epoch
 - **`--model_id_with_origin_paths`**: FLUX.1-dev model components to load
-- **`--learning_rate 1e-5`**: Learning rate for training
+- **`--learning_rate 1e-5`**: Learning rate for stage one training
 - **`--steps_per_epoch 30000`**: Number of training steps per epoch
 - **`--num_epochs 10`**: Total number of training epochs
 - **`--lora_base_model "dit"`**: Applies LoRA to the DiT (Diffusion Transformer) model
@@ -83,6 +86,9 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --main_process_port 35664 example
 - **`--use_gradient_checkpointing`**: Enables gradient checkpointing for memory efficiency
 - **`--gradient_accumulation_steps 4`**: Accumulates gradients over 4 steps
 - **`--save_steps 800`**: Saves checkpoints every 800 steps
+- **`--reflow_loss False`**: Whether to use reflow loss for training
+- **`--stage_one False`**: Whether to use stage one training (bbox-only training)
+- **`--stage_one_checkpoint None`**: Path to load pretrained stage one checkpoint (bbox embeddings)
 
 ## Training Process
 

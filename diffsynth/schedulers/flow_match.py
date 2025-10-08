@@ -75,7 +75,18 @@ class FlowMatchScheduler():
             sigma_ = self.sigmas[timestep_id + 1]
         prev_sample = sample + model_output * (sigma_ - sigma)
         return prev_sample
-    
+
+    def step_backward(self, model_output, timestep1, timestep2, sample):
+        if isinstance(timestep1, torch.Tensor):
+            timestep1 = timestep1.cpu()
+        if isinstance(timestep2, torch.Tensor):
+            timestep2 = timestep2.cpu()
+        timestep_id1 = torch.argmin((self.timesteps - timestep1).abs())
+        timestep_id2 = torch.argmin((self.timesteps - timestep2).abs())
+        sigma1 = self.sigmas[timestep_id1]
+        sigma2 = self.sigmas[timestep_id2]
+        prev_sample = sample + model_output * (sigma2 - sigma1)
+        return prev_sample, sigma1, sigma2
 
     def return_to_timestep(self, timestep, sample, sample_stablized):
         if isinstance(timestep, torch.Tensor):

@@ -109,6 +109,7 @@ def example(pipe, seeds, example_id, global_prompt, entity_prompts):
         masks.append(Image.fromarray(mask.astype(np.uint8)))
 
     masks = [masks]
+    bboxes = [bbox[0] for bbox in bboxes]
     
     for seed in seeds:
         # generate image
@@ -123,6 +124,7 @@ def example(pipe, seeds, example_id, global_prompt, entity_prompts):
             width=1024,
             eligen_entity_prompts=entity_prompts,
             eligen_entity_masks=masks,
+            eligen_entity_bboxes=bboxes,
             # eligen_enable_on_negative=True,
         )
         image.save(f"eligen_example_{example_id}_{seed}.png")
@@ -139,7 +141,7 @@ pipe = FluxImagePipeline.from_pretrained(
     ],
 )
 
-LORA_path = "/mnt/sphere/nvme-backups/luogeng/shivansh/Temp2/Diffsynth/models/train/FLUX.1-dev-EliGen_lora/step-10000.safetensors"
+LORA_path = "models/train/FLUX.1-dev-EliGen_lora/step-6400.safetensors"
 lora_state_dict = dict()
 bbox_state_dict = dict()
 
@@ -150,49 +152,43 @@ with safe_open(LORA_path, framework="pt") as f:
         else:
             lora_state_dict[key] = f.get_tensor(key)
 
-print("lora_state_dict keys: ", len(lora_state_dict))
-print("bbox_state_dict keys: ", len(bbox_state_dict))
+load_result = pipe.dit.load_state_dict(bbox_state_dict, strict=False)
+if len(load_result[1]) > 0:
+    print(f"Warning, LoRA key mismatch! Unexpected keys in LoRA checkpoint: {load_result[1]}")
 
-# Load bbox state dict into pipe.dit
-missing_keys, unexpected_keys = pipe.dit.load_state_dict(bbox_state_dict, strict=False)
-    
-print(f"Bbox unexpected keys: {len(unexpected_keys)}")
-if unexpected_keys:
-    print(f"Bbox unexpected keys: {unexpected_keys[:5]}...")
-
-pipe.load_lora(pipe.dit, state_dict=lora_state_dict, alpha=1)
+pipe.load_lora(pipe.dit, state_dict=lora_state_dict, alpha=1.0)
 
 # example 1
 global_prompt = ["A breathtaking beauty of Raja Ampat by the late-night moonlight , one beautiful woman from behind wearing a pale blue long dress with soft glow, sitting at the top of a cliff looking towards the beach,pastell light colors, a group of small distant birds flying in far sky, a boat sailing on the sea, best quality, realistic, whimsical, fantastic, splash art, intricate detailed, hyperdetailed, maximalist style, photorealistic, concept art, sharp focus, harmony, serenity, tranquility, soft pastell colors,ambient occlusion, cozy ambient lighting, masterpiece, liiv1, linquivera, metix, mentixis, masterpiece, award winning, view from above\n"]
 entity_prompts = [["cliff", "sea", "moon", "sailing boat", "a seated beautiful woman", "pale blue long dress with soft glow"]]
-example(pipe, [0], 1, global_prompt, entity_prompts)
+example(pipe, [0, 1, 2, 3], 1, global_prompt, entity_prompts)
 
 # example 2
 global_prompt = ["samurai girl wearing a kimono, she's holding a sword  glowing with red flame, her long hair is flowing in the wind, she is looking at a small bird perched on the back of her hand. ultra realist style. maximum image detail. maximum realistic render."]
 entity_prompts = [["flowing hair", "sword glowing with red flame", "A cute bird", "blue belt"]]
-example(pipe, [0], 2, global_prompt, entity_prompts)
+# example(pipe, [0, 1, 2, 3], 2, global_prompt, entity_prompts)
 
 # example 3
 global_prompt = ["Image of a neverending staircase up to a mysterious palace in the sky, The ancient palace stood majestically atop a mist-shrouded mountain, sunrise, two traditional monk walk in the stair looking at the sunrise, fog,see-through, best quality, whimsical, fantastic, splash art, intricate detailed, hyperdetailed, photorealistic, concept art, harmony, serenity, tranquility, ambient occlusion, halation, cozy ambient lighting, dynamic lighting,masterpiece, liiv1, linquivera, metix, mentixis, masterpiece, award winning,"]
 entity_prompts = [["ancient palace", "stone staircase with railings", "a traditional monk", "a traditional monk"]]
-example(pipe, [27], 3, global_prompt, entity_prompts)
+example(pipe, [27, 28, 29, 30], 3, global_prompt, entity_prompts)
 
 # example 4
 global_prompt = ["A beautiful girl wearing shirt and shorts in the street,  holding a sign 'Entity Control'"]
 entity_prompts = [["A beautiful girl", "sign 'Entity Control'", "shorts", "shirt"]]
-example(pipe, [21], 4, global_prompt, entity_prompts)
+example(pipe, [21, 22, 23, 24], 4, global_prompt, entity_prompts)
 
 # example 5
 global_prompt = ["A captivating, dramatic scene in a painting that exudes mystery and foreboding. A white sky, swirling blue clouds, and a crescent yellow moon illuminate a solitary woman standing near the water's edge. Her long dress flows in the wind, silhouetted against the eerie glow. The water mirrors the fiery sky and moonlight, amplifying the uneasy atmosphere."]
 entity_prompts = [["crescent yellow moon", "a solitary woman", "water", "swirling blue clouds"]]
-example(pipe, [0], 5, global_prompt, entity_prompts)
+# example(pipe, [0], 5, global_prompt, entity_prompts)
 
 # example 6
 global_prompt = ["Snow White and the 6 Dwarfs."]
 entity_prompts = [["Dwarf 1", "Dwarf 2", "Dwarf 3", "Snow White", "Dwarf 4", "Dwarf 5", "Dwarf 6"]]
-example(pipe, [8], 6, global_prompt, entity_prompts)
+example(pipe, [8, 9, 10, 11], 6, global_prompt, entity_prompts)
 
 # example 7, same prompt with different seeds
 global_prompt = ["A beautiful woman wearing white dress, holding a mirror, with a warm light background;"]
 entity_prompts = [["A beautiful woman", "mirror", "necklace", "glasses", "earring", "white dress", "jewelry headpiece"]]
-example(pipe, [0], 7, global_prompt, entity_prompts)
+example(pipe, [0, 1, 2, 3], 7, global_prompt, entity_prompts)

@@ -183,25 +183,44 @@ class FluxImagePipeline(BasePipeline):
                     module.lora_B_weights.clear()
     
     
-    def training_loss(self, **inputs):
-        timestep_id = torch.randint(0, self.scheduler.num_train_timesteps, (1,))
-        timestep = self.scheduler.timesteps[timestep_id].to(dtype=self.torch_dtype, device=self.device)
-        
-        inputs["latents"] = self.scheduler.add_noise(inputs["input_latents"], inputs["noise"], timestep)
-        training_target = self.scheduler.training_target(inputs["input_latents"], inputs["noise"], timestep)
+    def training_loss(self, **inputs, reflow_loss=False):
+        timestep_id_1 = torch.randint(10, self.scheduler.num_train_timesteps, (1,))
+        timestep_id_2 = max(torch.tensor([10]), timestep_id_1 - 100)
+
+        timestep_1 = self.scheduler.timesteps[timestep_id_1].to(dtype=self.torch_dtype, device=self.device)
+        timestep_2 = self.scheduler.timesteps[timestep_id_2].to(dtype=self.torch_dtype, device=self.device)
+
+        inputs["latents"] = self.scheduler.add_noise(inputs["input_latents"], inputs["noise"], timestep_1)
+        training_target = self.scheduler.training_target(inputs["input_latents"], inputs["noise"], timestep_1)
 
         inputs["eligen_entity_bboxes"] = torch.tensor(inputs["eligen_entity_bboxes"]).to(dtype=self.torch_dtype, device=self.device)
-        inputs["bbox_emb"] = self.scheduler.add_noise(inputs["eligen_entity_bboxes"], inputs["noise_bbox"], timestep)
-        training_target_bbox = self.scheduler.training_target(inputs["eligen_entity_bboxes"], inputs["noise_bbox"], timestep)
+        inputs["bbox_emb"] = self.scheduler.add_noise(inputs["eligen_entity_bboxes"], inputs["noise_bbox"], timestep_1)
+        training_target_bbox = self.scheduler.training_target(inputs["eligen_entity_bboxes"], inputs["noise_bbox"], timestep_1)
         
-        noise_pred, noise_pred_bbox = self.model_fn(**inputs, timestep=timestep)
+        noise_pred_1, noise_pred_bbox_1 = self.model_fn(**inputs, timestep=timestep_1)
+        loss_latent_1 = torch.nn.functional.mse_loss(noise_pred_1.float(), training_target.float())
+        loss_bbox_1 = torch.nn.functional.mse_loss(noise_pred_bbox_1.float(), training_target_bbox.float())
+
+        if reflow_loss:
+            inputs["latents"], sigma1, sigma2 = self.scheduler.step_backward(noise_pred_1, timestep_1, timestep_2, inputs["latents"])
+            inputs["bbox_emb"], sigma1, sigma2 = self.scheduler.step_backward(noise_pred_bbox_1, timestep_1, timestep_2, inputs["bbox_emb"])
+
+            noise_pred_2, noise_pred_bbox_2 = self.model_fn(**inputs, timestep=timestep_2)
+            final_noise_pred = ((1 - sigma2) * noise_pred_2 + (sigma2 - sigma1) * noise_pred_1) / (1 - sigma1)
+            final_noise_pred_bbox = ((1 - sigma2) * noise_pred_bbox_2 + (sigma2 - sigma1) * noise_pred_bbox_1) / (1 - sigma1)
+
+            loss_latent_2 = torch.nn.functional.mse_loss(final_noise_pred.float(), training_target.float())
+            loss_bbox_2 = torch.nn.functional.mse_loss(final_noise_pred_bbox.float(), training_target_bbox.float())
+
+            loss_latent = loss_latent_1 + loss_latent_2
+            loss_bbox = loss_bbox_1 + loss_bbox_2
+        else:
+            loss_latent = loss_latent_1
+            loss_bbox = loss_bbox_1
         
-        loss_latent = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
-        loss_bbox = torch.nn.functional.mse_loss(noise_pred_bbox.float(), training_target_bbox.float())
         loss = loss_latent + loss_bbox
-        loss = loss * self.scheduler.training_weight(timestep)
+        loss = loss * self.scheduler.training_weight(timestep_1)
         return loss, loss_latent, loss_bbox
-    
     
     def _enable_vram_management_with_default_config(self, model, vram_limit):
         if model is not None:
@@ -536,18 +555,22 @@ class FluxImagePipeline(BasePipeline):
         for unit in self.units:
             inputs_shared, inputs_posi, inputs_nega = self.unit_runner(unit, self, inputs_shared, inputs_posi, inputs_nega)
 
-        inputs_shared["bbox_emb"] = inputs_shared["noise_bbox"]
+        # inputs_shared["bbox_emb"] = inputs_shared["noise_bbox"]
+        inputs_shared["eligen_entity_bboxes"] = np.array(eligen_entity_bboxes)
+        inputs_shared["eligen_entity_bboxes"] = 2 * inputs_shared["eligen_entity_bboxes"] - 1
+        inputs_shared["eligen_entity_bboxes"] = torch.tensor(inputs_shared["eligen_entity_bboxes"]).to(dtype=self.torch_dtype, device=self.device)
 
         # Denoise
         self.load_models_to_device(self.in_iteration_models)
         models = {name: getattr(self, name) for name in self.in_iteration_models}
         for progress_id, timestep in enumerate(progress_bar_cmd(self.scheduler.timesteps)):
             timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
+            inputs_shared["bbox_emb"] = self.scheduler.add_noise(inputs_shared["eligen_entity_bboxes"], inputs_shared["noise_bbox"], timestep)
 
             # Inference
-            noise_pred_posi, bbox_noise_pred_posi = self.model_fn(**models, **inputs_shared, **inputs_posi, timestep=timestep, progress_id=progress_id)
+            noise_pred_posi, bbox_noise_pred_posi = self.model_fn(**models, **inputs_shared, **inputs_posi, timestep=timestep, progress_id=progress_id, train=False)
             if cfg_scale != 1.0:
-                noise_pred_nega, bbox_noise_pred_nega = self.model_fn(**models, **inputs_shared, **inputs_nega, timestep=timestep, progress_id=progress_id)
+                noise_pred_nega, bbox_noise_pred_nega = self.model_fn(**models, **inputs_shared, **inputs_nega, timestep=timestep, progress_id=progress_id, train=False)
                 noise_pred = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
                 bbox_noise_pred = bbox_noise_pred_nega + cfg_scale * (bbox_noise_pred_posi - bbox_noise_pred_nega)
             else:
@@ -556,7 +579,7 @@ class FluxImagePipeline(BasePipeline):
 
             # Scheduler
             inputs_shared["latents"] = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], inputs_shared["latents"])
-            inputs_shared["bbox_emb"] = self.scheduler.step(bbox_noise_pred, self.scheduler.timesteps[progress_id], inputs_shared["bbox_emb"])
+            # inputs_shared["bbox_emb"] = self.scheduler.step(bbox_noise_pred, self.scheduler.timesteps[progress_id], inputs_shared["bbox_emb"])
         
         # Decode
         self.load_models_to_device(['vae_decoder'])
@@ -1164,6 +1187,7 @@ def model_fn_flux_image(
     num_inference_steps=1,
     use_gradient_checkpointing=False,
     use_gradient_checkpointing_offload=False,
+    train=True,
     **kwargs
 ):
     if tiled:
@@ -1234,9 +1258,16 @@ def model_fn_flux_image(
     if image_ids is None:
         image_ids = dit.prepare_image_ids(hidden_states)
     
-    bbox_emb = dit.bbox_embedder(bbox_emb)
+    if train:
+        bbox_emb = dit.bbox_embedder(bbox_emb.to(dtype=torch.float32))
+    else:
+        bbox_emb = dit.bbox_embedder(bbox_emb)
     conditioning = dit.time_embedder(timestep, hidden_states.dtype) + dit.pooled_text_embedder(pooled_prompt_emb)
-    bbox_condtioning = dit.bbox_temb(conditioning)
+    if train:
+        bbox_condtioning = dit.bbox_temb(conditioning.to(dtype=torch.float32))
+    else:
+        bbox_condtioning = dit.bbox_temb(conditioning)
+
     if dit.guidance_embedder is not None:
         guidance = guidance * 1000
         conditioning = conditioning + dit.guidance_embedder(guidance, hidden_states.dtype)

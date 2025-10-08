@@ -536,7 +536,7 @@ def launch_training_task(
     
     # Create CSV headers
     with open(step_csv_path, "w", newline="") as f:
-        f.write("step,loss,loss_latent,loss_bbox\n")
+        f.write("step,loss,loss_latent,loss_bbox,lr\n")
     with open(epoch_csv_path, "w", newline="") as f:
         f.write("epoch,avg_loss,avg_loss_latent,avg_loss_bbox\n")
     
@@ -565,7 +565,7 @@ def launch_training_task(
 
                 # Update step CSV in real-time
                 with open(step_csv_path, "a", newline="") as f:
-                    f.write(f"{global_step},{loss_value},{loss_latent.item()},{loss_bbox.item()}\n")
+                    f.write(f"{global_step},{loss_value},{loss_latent.item()},{loss_bbox.item()},{scheduler.get_last_lr()}\n")
                 
                 # Update progress bar with current loss
                 avg_loss = sum(epoch_losses) / len(epoch_losses)
@@ -674,6 +674,9 @@ def flux_parser():
     parser.add_argument("--dataset_num_workers", type=int, default=0, help="Number of workers for data loading.")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay.")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for training.")
+    parser.add_argument("--reflow_loss", type=bool, default=False, help="Whether to use reflow loss.")
+    parser.add_argument("--stage_one", type=bool, default=False, help="Whether to use stage one.")
+    parser.add_argument("--stage_one_checkpoint", type=str, default=None, help="Path to the stage one checkpoint. If provided, stage one will be loaded from this checkpoint.")
     return parser
 
 

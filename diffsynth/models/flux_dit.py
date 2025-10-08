@@ -100,7 +100,8 @@ class FourierBBoxEmbedding(nn.Module):
         # Reshape for batch processing through linear layer
         B, N, D = fourier_embeddings.shape
         flat_embeddings = fourier_embeddings.reshape(-1, D)
-        flat_embeddings = flat_embeddings.to(torch.bfloat16)
+        # flat_embeddings = flat_embeddings.to(torch.float32)
+        # flat_embeddings = flat_embeddings.to(torch.bfloat16)
 
         # Apply projection
         projected_embeddings = self.projection(flat_embeddings)
@@ -198,18 +199,19 @@ class FluxJointAttention(torch.nn.Module):
 
         q, k = self.apply_rope(q, k, image_rotary_emb)
 
-        hidden_states = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        hidden_states = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask.to(dtype=q.dtype))
+        # hidden_states = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, self.num_heads * self.head_dim)
         hidden_states = hidden_states.to(q.dtype)
         hidden_states_b, hidden_states_a, hidden_states_c = hidden_states[:, :hidden_states_b.shape[1]], hidden_states[:, hidden_states_b.shape[1]:hidden_states_b.shape[1] + hidden_states_a.shape[1]], hidden_states[:, hidden_states_b.shape[1] + hidden_states_a.shape[1]:]
         if ipadapter_kwargs_list is not None:
             hidden_states_a = interact_with_ipadapter(hidden_states_a, q_a, **ipadapter_kwargs_list)
-        hidden_states_a = self.a_to_out(hidden_states_a)
+        hidden_states_a = self.a_to_out(hidden_states_a.to(dtype=torch.bfloat16))
         hidden_states_c = self.c_to_out(hidden_states_c)
         if self.only_out_a:
             return hidden_states_a
         else:
-            hidden_states_b = self.b_to_out(hidden_states_b)
+            hidden_states_b = self.b_to_out(hidden_states_b.to(dtype=torch.bfloat16))
             return hidden_states_a, hidden_states_b, hidden_states_c
 
 
@@ -482,8 +484,8 @@ class FluxDiT(torch.nn.Module):
             # prompt update with image
             attention_mask[:, bbox_start_i:bbox_end_i, prompt_start:prompt_end] = True
             attention_mask[:, prompt_start:prompt_end, bbox_start_i:bbox_end_i] = True
-            attention_mask[:, bbox_start_i:bbox_end_i, image_start:image_end] = bbox_mask
-            attention_mask[:, image_start:image_end, bbox_start_i:bbox_end_i] = bbox_mask.transpose(1, 2)  
+            # attention_mask[:, bbox_start_i:bbox_end_i, image_start:image_end] = bbox_mask
+            # attention_mask[:, image_start:image_end, bbox_start_i:bbox_end_i] = bbox_mask.transpose(1, 2)  
             attention_mask[:, prompt_start:prompt_end, image_start:image_end] = image_mask
             # image update with prompt
             attention_mask[:, image_start:image_end, prompt_start:prompt_end] = image_mask.transpose(1, 2)

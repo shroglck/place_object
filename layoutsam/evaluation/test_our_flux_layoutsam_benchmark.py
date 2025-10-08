@@ -33,7 +33,7 @@ def main(lora_rank: int):
         ],
     )
 
-    LORA_path = "/mnt/sphere/nvme-backups/luogeng/shivansh/Temp2/Diffsynth/models/train/FLUX.1-dev-EliGen_lora/step-10000.safetensors"
+    LORA_path = "models/train/FLUX.1-dev-EliGen_lora/step-6800.safetensors"
     lora_state_dict = dict()
     bbox_state_dict = dict()
 
@@ -44,17 +44,11 @@ def main(lora_rank: int):
             else:
                 lora_state_dict[key] = f.get_tensor(key)
 
-    print("lora_state_dict keys: ", len(lora_state_dict))
-    print("bbox_state_dict keys: ", len(bbox_state_dict))
+    load_result = pipe.dit.load_state_dict(bbox_state_dict, strict=False)
+    if len(load_result[1]) > 0:
+        print(f"Warning, LoRA key mismatch! Unexpected keys in LoRA checkpoint: {load_result[1]}")
 
-    # Load bbox state dict into pipe.dit
-    missing_keys, unexpected_keys = pipe.dit.load_state_dict(bbox_state_dict, strict=False)
-        
-    print(f"Bbox unexpected keys: {len(unexpected_keys)}")
-    if unexpected_keys:
-        print(f"Bbox unexpected keys: {unexpected_keys[:5]}...")
-
-    pipe.load_lora(pipe.dit, state_dict=lora_state_dict, alpha=1)
+    pipe.load_lora(pipe.dit, state_dict=lora_state_dict, alpha=1.0)
     pipe.to(device)
     pipe.device = device
 
@@ -82,10 +76,11 @@ def main(lora_rank: int):
                 masks.append(Image.fromarray(mask.astype(np.uint8)))
 
             masks = [masks]
+            bboxes = [bbox[0].cpu().numpy() for bbox in bboxes]
 
             image, bbox = pipe(
                 prompt=global_caption,
-                cfg_scale=1.0,
+                cfg_scale=3.0,
                 negative_prompt=negative_prompt,
                 num_inference_steps=50,
                 embedded_guidance=3.5,
@@ -94,6 +89,7 @@ def main(lora_rank: int):
                 width=target_width,
                 eligen_entity_prompts=region_caption_list,
                 eligen_entity_masks=masks,
+                eligen_entity_bboxes=bboxes,
                 # eligen_enable_on_negative=True,
             )
             image.save(image_path)
