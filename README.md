@@ -57,10 +57,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --main_process_port 35664 example
   --lora_alpha 4 \
   --use_gradient_checkpointing \
   --gradient_accumulation_steps 4 \
-  --save_steps 800 \
-  --reflow_loss False \
-  --stage_one False \
-  --stage_one_checkpoint None
+  --save_steps 800
 ```
 
 ### Command Parameters Explained
@@ -86,9 +83,9 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --main_process_port 35664 example
 - **`--use_gradient_checkpointing`**: Enables gradient checkpointing for memory efficiency
 - **`--gradient_accumulation_steps 4`**: Accumulates gradients over 4 steps
 - **`--save_steps 800`**: Saves checkpoints every 800 steps
-- **`--reflow_loss False`**: Whether to use reflow loss for training
-- **`--stage_one False`**: Whether to use stage one training (bbox-only training)
-- **`--stage_one_checkpoint None`**: Path to load pretrained stage one checkpoint (bbox embeddings)
+- **`--reflow_loss`**: Enables use of reflow loss for training
+- **`--stage_one`**: Enables stage one training (bbox-only training)
+- **`--stage_one_checkpoint`**: Path to load pretrained stage one checkpoint (bbox embeddings)
 
 ## Training Process
 

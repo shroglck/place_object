@@ -20,6 +20,7 @@ class FluxTrainingModule(DiffusionTrainingModule):
         extra_inputs=None,
         lora_alpha=None,
         stage_one_checkpoint=None,
+        reflow_loss=False,
     ):
         super().__init__()
         # Load models
@@ -31,6 +32,7 @@ class FluxTrainingModule(DiffusionTrainingModule):
             model_id_with_origin_paths = model_id_with_origin_paths.split(",")
             model_configs += [ModelConfig(model_id=i.split(":")[0], origin_file_pattern=i.split(":")[1]) for i in model_id_with_origin_paths]
         self.pipe = FluxImagePipeline.from_pretrained(torch_dtype=torch.bfloat16, device="cpu", model_configs=model_configs)
+        self.reflow_loss = reflow_loss
         
         # Reset training scheduler
         self.pipe.scheduler.set_timesteps(1000, training=True)
@@ -146,6 +148,7 @@ class FluxTrainingModule(DiffusionTrainingModule):
             "use_gradient_checkpointing_offload": self.use_gradient_checkpointing_offload,
             "batch_size": len(data["prompt"]),
             "eligen_entity_bboxes": data["eligen_entity_bboxes"],
+            "reflow_loss": self.reflow_loss,
         }
         
         # Extra inputs
@@ -189,6 +192,7 @@ if __name__ == "__main__":
         extra_inputs=args.extra_inputs,
         lora_alpha=args.lora_alpha,
         stage_one_checkpoint=args.stage_one_checkpoint,
+        reflow_loss=args.reflow_loss,
     )
     model_logger = ModelLogger(
         args.output_path,

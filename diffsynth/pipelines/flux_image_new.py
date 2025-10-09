@@ -183,7 +183,7 @@ class FluxImagePipeline(BasePipeline):
                     module.lora_B_weights.clear()
     
     
-    def training_loss(self, **inputs, reflow_loss=False):
+    def training_loss(self, **inputs):
         timestep_id_1 = torch.randint(10, self.scheduler.num_train_timesteps, (1,))
         timestep_id_2 = max(torch.tensor([10]), timestep_id_1 - 100)
 
@@ -201,7 +201,7 @@ class FluxImagePipeline(BasePipeline):
         loss_latent_1 = torch.nn.functional.mse_loss(noise_pred_1.float(), training_target.float())
         loss_bbox_1 = torch.nn.functional.mse_loss(noise_pred_bbox_1.float(), training_target_bbox.float())
 
-        if reflow_loss:
+        if inputs["reflow_loss"]:
             inputs["latents"], sigma1, sigma2 = self.scheduler.step_backward(noise_pred_1, timestep_1, timestep_2, inputs["latents"])
             inputs["bbox_emb"], sigma1, sigma2 = self.scheduler.step_backward(noise_pred_bbox_1, timestep_1, timestep_2, inputs["bbox_emb"])
 

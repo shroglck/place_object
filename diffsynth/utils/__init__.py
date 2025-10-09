@@ -59,6 +59,8 @@ class BasePipeline(torch.nn.Module):
 
     def preprocess_image(self, image, torch_dtype=None, device=None, pattern="B C H W", min_value=-1, max_value=1):
         # Transform a PIL.Image to torch.Tensor
+        if isinstance(image, list):
+            image = [np.array(img, dtype=np.float32) for img in image]
         image = torch.Tensor(np.array(image, dtype=np.float32))
         image = image.to(dtype=torch_dtype or self.torch_dtype, device=device or self.device)
         image = image * ((max_value - min_value) / 255) + min_value

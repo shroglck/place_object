@@ -46,7 +46,7 @@ class TextImageDataset(torch.utils.data.Dataset):
         entities = self.entity_dict[image_id]
         text = self.text[data_id]
 
-        while len(entities)==0 :
+        while len(entities) == 0 or not os.path.exists(self.path[data_id]):
             data_id = torch.randint(0, len(self.path), (1,))[0]
             data_id = (data_id + index) % len(self.path) # For fixed seed.
             image_id = self.path[data_id].split("/")[-1][:-4]
@@ -674,8 +674,8 @@ def flux_parser():
     parser.add_argument("--dataset_num_workers", type=int, default=0, help="Number of workers for data loading.")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay.")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for training.")
-    parser.add_argument("--reflow_loss", type=bool, default=False, help="Whether to use reflow loss.")
-    parser.add_argument("--stage_one", type=bool, default=False, help="Whether to use stage one.")
+    parser.add_argument("--reflow_loss", default=False, action="store_true", help="Whether to use reflow loss.")
+    parser.add_argument("--stage_one", default=False, action="store_true", help="Whether to use stage one.")
     parser.add_argument("--stage_one_checkpoint", type=str, default=None, help="Path to the stage one checkpoint. If provided, stage one will be loaded from this checkpoint.")
     return parser
 
