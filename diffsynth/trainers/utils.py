@@ -3,7 +3,7 @@ from peft import LoraConfig, inject_adapter_in_model
 from PIL import Image
 import pandas as pd
 from tqdm import tqdm
-from accelerate import Accelerator
+from accelerate import Accelerator, FullyShardedDataParallelPlugin
 from accelerate.utils import DistributedDataParallelKwargs
 import numpy as np
 
@@ -523,9 +523,20 @@ def launch_training_task(
         num_workers=num_workers,
         batch_size=batch_size
     )
+    fsdp_plugin = FullyShardedDataParallelPlugin(
+        fsdp_version=2,
+        auto_wrap_policy="TRANSFORMER_BASED_WRAP",
+        transformer_cls_names_to_wrap=["FluxSingleTransformerBlock", "FluxJointTransformerBlock"],
+        state_dict_type="sharded_state_dict",
+        reshard_after_forward=True,
+        limit_all_gathers=True,
+        ignored_modules=[model.pipe.text_encoder_1, model.pipe.text_encoder_2, model.pipe.vae_encoder, model.pipe.vae_decoder],
+    )
     accelerator = Accelerator(
         gradient_accumulation_steps=gradient_accumulation_steps,
         kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=find_unused_parameters)],
+        fsdp_plugin=fsdp_plugin,
+        mixed_precision="bf16",
     )
     model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
     

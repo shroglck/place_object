@@ -203,21 +203,23 @@ if __name__ == "__main__":
     if args.stage_one:
         optimizer = torch.optim.AdamW(model.trainable_modules(), lr=args.learning_rate, weight_decay=args.weight_decay)
     else:
-        named_params = list(model.pipe.dit.named_parameters())
-        trainable = [(n, p) for n, p in named_params if p.requires_grad]
+        def get_bbox_params(model_to_iterate):
+            """Generator for bbox-related parameters."""
+            for n, p in model_to_iterate.named_parameters():
+                if p.requires_grad and (("bbox" in n) or ("_c" in n) or ("c_" in n)):
+                    yield p
 
-        # BBox: contains "bbox", "_c", or "c_"
-        bbox_names = {n for n, _ in trainable if ("bbox" in n) or ("_c" in n) or ("c_" in n)}
-        bbox_params = [p for n, p in trainable if n in bbox_names]
-
-        # LoRA: everything else that is trainable
-        lora_params = [p for n, p in trainable if n not in bbox_names]
-
-        print(f"bbox params: {len(bbox_params)}, lora params: {len(lora_params)}")
+        def get_lora_params(model_to_iterate):
+            """Generator for all other trainable parameters (LoRA)."""
+            for n, p in model_to_iterate.named_parameters():
+                is_bbox = ("bbox" in n) or ("_c" in n) or ("c_" in n)
+                if p.requires_grad and not is_bbox:
+                    yield p
+        
         optimizer = torch.optim.AdamW(
             [
-                {"params": bbox_params, "lr": 1e-5, "weight_decay": args.weight_decay},
-                {"params": lora_params, "lr": 1e-4, "weight_decay": args.weight_decay},
+                {"params": get_bbox_params(model.pipe.dit), "lr": 1e-5, "weight_decay": args.weight_decay},
+                {"params": get_lora_params(model.pipe.dit), "lr": 1e-4, "weight_decay": args.weight_decay},
             ]
         )
     
