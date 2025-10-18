@@ -531,14 +531,20 @@ def launch_training_task(
         reshard_after_forward=True,
         limit_all_gathers=True,
         ignored_modules=[model.pipe.text_encoder_1, model.pipe.text_encoder_2, model.pipe.vae_encoder, model.pipe.vae_decoder],
+        activation_checkpointing=True,
+        min_num_params=1_000_000,
+        cpu_offload=True
     )
     accelerator = Accelerator(
         gradient_accumulation_steps=gradient_accumulation_steps,
         kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=find_unused_parameters)],
         fsdp_plugin=fsdp_plugin,
-        mixed_precision="bf16",
+        # mixed_precision="bf16",
     )
     model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
+    
+    # manually move pipe to model device
+    model.pipe.device = accelerator.device
     
     # Initialize CSV files for real-time logging
     os.makedirs(model_logger.output_path, exist_ok=True)
