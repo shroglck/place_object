@@ -31,7 +31,7 @@ class FluxTrainingModule(DiffusionTrainingModule):
         if model_id_with_origin_paths is not None:
             model_id_with_origin_paths = model_id_with_origin_paths.split(",")
             model_configs += [ModelConfig(model_id=i.split(":")[0], origin_file_pattern=i.split(":")[1]) for i in model_id_with_origin_paths]
-        self.pipe = FluxImagePipeline.from_pretrained(torch_dtype=torch.bfloat16, device="cpu", model_configs=model_configs)
+        self.pipe = FluxImagePipeline.from_pretrained(torch_dtype=torch.float32, device="cpu", model_configs=model_configs)
         self.reflow_loss = reflow_loss
         
         # Reset training scheduler
@@ -92,9 +92,9 @@ class FluxTrainingModule(DiffusionTrainingModule):
             if len(unexpected) > 0:
                 print(f"Warning, Bbox key mismatch! Unexpected keys in Stage One checkpoint: {unexpected}")
 
-        for name, param in self.pipe.dit.named_parameters():
-            if param.requires_grad:
-                param.data = param.to(torch.float32)
+        # for name, param in self.pipe.dit.named_parameters():
+        #     if param.requires_grad:
+        #         param.data = param.to(torch.float32)
         
         trainable_params = sum(p.numel() for p in self.pipe.dit.parameters() if p.requires_grad)
         print(f"Total trainable parameters: {trainable_params}")

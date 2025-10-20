@@ -78,7 +78,6 @@ class MultiControlNet(torch.nn.Module):
 
 
 class FluxImagePipeline(BasePipeline):
-
     def __init__(self, device="cuda", torch_dtype=torch.bfloat16):
         super().__init__(
             device=device, torch_dtype=torch_dtype,
@@ -1259,12 +1258,12 @@ def model_fn_flux_image(
         image_ids = dit.prepare_image_ids(hidden_states)
     
     if train:
-        bbox_emb = dit.bbox_embedder(bbox_emb.to(dtype=torch.float32))
+        bbox_emb = dit.bbox_embedder(bbox_emb)
     else:
         bbox_emb = dit.bbox_embedder(bbox_emb)
     conditioning = dit.time_embedder(timestep, hidden_states.dtype) + dit.pooled_text_embedder(pooled_prompt_emb)
     if train:
-        bbox_condtioning = dit.bbox_temb(conditioning.to(dtype=torch.float32))
+        bbox_condtioning = dit.bbox_temb(conditioning)
     else:
         bbox_condtioning = dit.bbox_temb(conditioning)
 

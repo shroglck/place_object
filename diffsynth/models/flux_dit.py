@@ -44,7 +44,7 @@ class FourierBBoxEmbedding(nn.Module):
         # Linear projection from fourier_dim to output_dim
         self.projection = nn.Linear(fourier_dim, output_dim)
         
-        
+    @torch.no_grad()
     def _get_fourier_embedding(self, bbox):
         """
         Transform bbox coordinates to Fourier embeddings
@@ -94,7 +94,7 @@ class FourierBBoxEmbedding(nn.Module):
             Tensor of shape [B, N, output_dim] with final embeddings
         """
         # Get Fourier embeddings
-        fourier_embeddings = self._get_fourier_embedding(bbox)
+        fourier_embeddings = self._get_fourier_embedding(bbox).to(bbox.dtype)
         
         # Project to higher dimension
         # Reshape for batch processing through linear layer
@@ -206,12 +206,12 @@ class FluxJointAttention(torch.nn.Module):
         hidden_states_b, hidden_states_a, hidden_states_c = hidden_states[:, :hidden_states_b.shape[1]], hidden_states[:, hidden_states_b.shape[1]:hidden_states_b.shape[1] + hidden_states_a.shape[1]], hidden_states[:, hidden_states_b.shape[1] + hidden_states_a.shape[1]:]
         if ipadapter_kwargs_list is not None:
             hidden_states_a = interact_with_ipadapter(hidden_states_a, q_a, **ipadapter_kwargs_list)
-        hidden_states_a = self.a_to_out(hidden_states_a.to(dtype=torch.bfloat16))
+        hidden_states_a = self.a_to_out(hidden_states_a)
         hidden_states_c = self.c_to_out(hidden_states_c)
         if self.only_out_a:
             return hidden_states_a
         else:
-            hidden_states_b = self.b_to_out(hidden_states_b.to(dtype=torch.bfloat16))
+            hidden_states_b = self.b_to_out(hidden_states_b)
             return hidden_states_a, hidden_states_b, hidden_states_c
 
 
