@@ -6,6 +6,7 @@ from .utils import init_weights_on_device, hash_state_dict_keys
 import torch.nn as nn
 import numpy as np
 
+ 
 def interact_with_ipadapter(hidden_states, q, ip_k, ip_v, scale=1.0):
     batch_size, num_tokens = hidden_states.shape[0:2]
     ip_hidden_states = torch.nn.functional.scaled_dot_product_attention(q, ip_k, ip_v)
@@ -119,11 +120,11 @@ class RoPEEmbedding(torch.nn.Module):
         self.theta = theta
         self.axes_dim = axes_dim
 
-
+    @torch.no_grad()
     def rope(self, pos: torch.Tensor, dim: int, theta: int) -> torch.Tensor:
         assert dim % 2 == 0, "The dimension must be even."
 
-        scale = torch.arange(0, dim, 2, dtype=torch.float64, device=pos.device) / dim
+        scale = torch.arange(0, dim, 2, dtype=torch.float32, device=pos.device) / dim
         omega = 1.0 / (theta**scale)
 
         batch_size, seq_length = pos.shape
@@ -133,8 +134,7 @@ class RoPEEmbedding(torch.nn.Module):
 
         stacked_out = torch.stack([cos_out, -sin_out, sin_out, cos_out], dim=-1)
         out = stacked_out.view(batch_size, -1, dim // 2, 2, 2)
-        return out.float()
-
+        return out
 
     def forward(self, ids):
         n_axes = ids.shape[-1]
@@ -166,6 +166,7 @@ class FluxJointAttention(torch.nn.Module):
 
 
     def apply_rope(self, xq, xk, freqs_cis):
+        freqs_cis = freqs_cis.float()
         xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
         xk_ = xk.float().reshape(*xk.shape[:-1], -1, 1, 2)
         xq_out = freqs_cis[..., 0] * xq_[..., 0] + freqs_cis[..., 1] * xq_[..., 1]
@@ -282,6 +283,7 @@ class FluxSingleAttention(torch.nn.Module):
 
 
     def apply_rope(self, xq, xk, freqs_cis):
+        freqs_cis = freqs_cis.float()
         xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
         xk_ = xk.float().reshape(*xk.shape[:-1], -1, 1, 2)
         xq_out = freqs_cis[..., 0] * xq_[..., 0] + freqs_cis[..., 1] * xq_[..., 1]
@@ -338,6 +340,7 @@ class FluxSingleTransformerBlock(torch.nn.Module):
 
 
     def apply_rope(self, xq, xk, freqs_cis):
+        freqs_cis = freqs_cis.float()
         xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
         xk_ = xk.float().reshape(*xk.shape[:-1], -1, 1, 2)
         xq_out = freqs_cis[..., 0] * xq_[..., 0] + freqs_cis[..., 1] * xq_[..., 1]
@@ -460,6 +463,7 @@ class FluxDiT(torch.nn.Module):
         return hidden_states
 
 
+    @torch.no_grad()
     def construct_mask(self, entity_masks, prompt_seq_len, image_seq_len, bbox_seq_len):
         N = len(entity_masks)
         batch_size = entity_masks[0].shape[0]
@@ -507,6 +511,7 @@ class FluxDiT(torch.nn.Module):
         return attention_mask
 
 
+    @torch.no_grad()
     def process_entity_masks(self, hidden_states, prompt_emb, entity_prompt_emb, entity_masks, text_ids, image_ids, bbox_ids = None):
         repeat_dim = hidden_states.shape[1]
         max_masks = 0

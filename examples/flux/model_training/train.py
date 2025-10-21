@@ -201,7 +201,7 @@ if __name__ == "__main__":
     )
 
     if args.stage_one:
-        optimizer = torch.optim.AdamW(model.trainable_modules(), lr=args.learning_rate, weight_decay=args.weight_decay)
+        optimizer = torch.optim.AdamW(model.trainable_modules(), lr=args.learning_rate, weight_decay=args.weight_decay, fused=True)
     else:
         def get_bbox_params(model_to_iterate):
             """Generator for bbox-related parameters."""
@@ -220,7 +220,8 @@ if __name__ == "__main__":
             [
                 {"params": get_bbox_params(model.pipe.dit), "lr": 1e-5, "weight_decay": args.weight_decay},
                 {"params": get_lora_params(model.pipe.dit), "lr": 1e-4, "weight_decay": args.weight_decay},
-            ]
+            ],
+            fused=True
         )
     
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)

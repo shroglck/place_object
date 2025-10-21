@@ -5,7 +5,6 @@ import pandas as pd
 from tqdm import tqdm
 from accelerate import Accelerator, FullyShardedDataParallelPlugin
 from accelerate.utils import DistributedDataParallelKwargs
-from torch.distributed.fsdp import MixedPrecisionPolicy
 import numpy as np
 
 class TextImageDataset(torch.utils.data.Dataset):
@@ -532,22 +531,18 @@ def launch_training_task(
         reshard_after_forward=True,
         ignored_modules=[model.pipe.text_encoder_1, model.pipe.text_encoder_2, model.pipe.vae_encoder, model.pipe.vae_decoder],
         min_num_params=1_000_000,
-        mixed_precision_policy=MixedPrecisionPolicy(
-            param_dtype=None,               # fp32 params
-            reduce_dtype=torch.bfloat16,    # bf16 gradient allreduce
-        )
     )
     accelerator = Accelerator(
         gradient_accumulation_steps=gradient_accumulation_steps,
         kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=find_unused_parameters)],
         fsdp_plugin=fsdp_plugin,
-        mixed_precision='bf16'
+        mixed_precision='bf16',
     )
     model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
     
     # manually move pipe to model device
     model.pipe.device = accelerator.device
-    
+    model.pipe.torch_dtype = torch.bfloat16
     # Initialize CSV files for real-time logging
     os.makedirs(model_logger.output_path, exist_ok=True)
     step_csv_path = os.path.join(model_logger.output_path, "step_loss_history.csv")
@@ -572,19 +567,20 @@ def launch_training_task(
                 optimizer.zero_grad()
                 loss, loss_latent, loss_bbox = model(data)
                 accelerator.backward(loss)
+                accelerator.clip_grad_norm_(model.trainable_modules(), max_norm=1.0)
                 optimizer.step()
                 model_logger.on_step_end(accelerator, model, save_steps)
                 scheduler.step()
                 
                 # Log loss
-                loss_value = loss.item()
+                loss_value = loss.detach().item()
                 epoch_losses.append(loss_value)
-                epoch_loss_latents.append(loss_latent.item())
-                epoch_loss_bboxes.append(loss_bbox.item())
+                epoch_loss_latents.append(loss_latent.detach().item())
+                epoch_loss_bboxes.append(loss_bbox.detach().item())
 
                 # Update step CSV in real-time
                 with open(step_csv_path, "a", newline="") as f:
-                    f.write(f"{global_step},{loss_value},{loss_latent.item()},{loss_bbox.item()},{scheduler.get_last_lr()}\n")
+                    f.write(f"{global_step},{loss_value},{loss_latent.item()},{loss_bbox.item()},{scheduler.get_last_lr()[0]}\n")
                 
                 # Update progress bar with current loss
                 avg_loss = sum(epoch_losses) / len(epoch_losses)
