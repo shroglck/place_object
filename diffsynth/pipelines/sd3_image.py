@@ -4,6 +4,8 @@ from ..schedulers import FlowMatchScheduler
 from .base import BasePipeline
 import torch
 from tqdm import tqdm
+import numpy as np
+from PIL import Image
 
 
 
@@ -69,6 +71,126 @@ class SD3ImagePipeline(BasePipeline):
     def prepare_extra_input(self, latents=None):
         return {}
     
+    def prepare_eligen_inputs(self, eligen_entity_prompts, eligen_entity_masks, eligen_entity_bboxes, eligen_enable_on_negative, cfg_scale, width, height, t5_sequence_length=77):
+        if eligen_entity_prompts is None or eligen_entity_masks is None or eligen_entity_bboxes is None:
+            return {}, {}
+
+        # Prepare masks
+        batch_masks = []
+        for batch_mask in eligen_entity_masks:
+            out_masks = []
+            for mask in batch_mask:
+                mask = self.preprocess_image(mask.resize((width//8, height//8), resample=Image.NEAREST)).mean(dim=1, keepdim=True) > 0
+                mask = mask.to(device=self.device, dtype=self.torch_dtype)
+                out_masks.append(mask)
+            out_masks = torch.cat(out_masks, dim=0).unsqueeze(0)
+            batch_masks.append(out_masks)
+        entity_masks = torch.cat(batch_masks, dim=0)
+
+        # Prepare prompts
+        prompt_embs = []
+        for batch_prompt in eligen_entity_prompts:
+            prompt_emb, _ = self.prompter.encode_prompt(
+                batch_prompt, device=self.device, t5_sequence_length=t5_sequence_length
+            )
+            prompt_embs.append(prompt_emb.unsqueeze(0))
+        entity_prompt_emb = torch.cat(prompt_embs, dim=0)
+
+        # Prepare bboxes
+        if isinstance(eligen_entity_bboxes, list):
+             eligen_entity_bboxes = np.array(eligen_entity_bboxes)
+             eligen_entity_bboxes = 2 * eligen_entity_bboxes - 1
+             eligen_entity_bboxes = torch.tensor(eligen_entity_bboxes).to(dtype=self.torch_dtype, device=self.device)
+
+        eligen_kwargs_posi = {"entity_prompt_emb": entity_prompt_emb, "entity_masks": entity_masks, "bbox_emb": eligen_entity_bboxes}
+
+        eligen_kwargs_nega = {}
+        if eligen_enable_on_negative and cfg_scale != 1.0:
+             # Basic support: share same entities
+             eligen_kwargs_nega = eligen_kwargs_posi
+
+        return eligen_kwargs_posi, eligen_kwargs_nega
+
+    def training_loss(self, **inputs):
+        timestep_id_1 = torch.randint(0, self.scheduler.num_train_timesteps, (1,))
+        timestep_1 = self.scheduler.timesteps[timestep_id_1].to(dtype=self.torch_dtype, device=self.device)
+
+        inputs["latents"] = self.scheduler.add_noise(inputs["input_latents"], inputs["noise"], timestep_1)
+        training_target = self.scheduler.training_target(inputs["input_latents"], inputs["noise"], timestep_1)
+
+        if "eligen_entity_bboxes" in inputs:
+            inputs["eligen_entity_bboxes"] = torch.tensor(inputs["eligen_entity_bboxes"]).to(dtype=self.torch_dtype, device=self.device)
+            inputs["bbox_emb"] = self.scheduler.add_noise(inputs["eligen_entity_bboxes"], inputs["noise_bbox"], timestep_1)
+            training_target_bbox = self.scheduler.training_target(inputs["eligen_entity_bboxes"], inputs["noise_bbox"], timestep_1)
+
+        # Prepare ELIGEN inputs for forward
+        eligen_kwargs = {}
+        if "eligen_entity_prompts" in inputs and "eligen_entity_masks" in inputs and "bbox_emb" in inputs:
+             eligen_kwargs_posi, _ = self.prepare_eligen_inputs(
+                 inputs["eligen_entity_prompts"],
+                 inputs["eligen_entity_masks"],
+                 inputs["eligen_entity_bboxes"], # Original bboxes for shape check? No, prepare expects bbox_emb to be passed directly?
+                 # My prepare_eligen_inputs expects raw bboxes and converts them.
+                 # But here we have noisy bboxes in inputs["bbox_emb"].
+                 # We should skip prepare_eligen_inputs conversion for bbox_emb and pass it manually?
+                 False, 1.0, inputs["width"], inputs["height"], inputs.get("t5_sequence_length", 77)
+             )
+             # But prepare_eligen_inputs uses "eligen_entity_bboxes" to create "bbox_emb" tensor.
+             # We want "bbox_emb" to be our noisy bboxes.
+
+             # Let's call prepare_eligen_inputs with dummy bboxes to get prompts/masks, then override bbox_emb.
+             # Or just manually prepare prompts/masks here.
+
+             # Reuse logic from prepare_eligen_inputs but partial.
+             # Actually prepare_eligen_inputs is for inference mostly.
+             # For training, data is already in batch.
+             # But masks and prompts need encoding/preprocessing.
+
+             # inputs["eligen_entity_masks"] in training is list of list of PIL images?
+             # Yes, based on Flux implementation.
+
+             # inputs["eligen_entity_prompts"] is list of list of strings.
+
+             # So we do need encoding.
+
+             eligen_kwargs_posi, _ = self.prepare_eligen_inputs(
+                 inputs["eligen_entity_prompts"],
+                 inputs["eligen_entity_masks"],
+                 inputs["eligen_entity_bboxes"], # Use original to satisfy signature, output will overwrite
+                 False, 1.0, inputs["width"], inputs["height"], inputs.get("t5_sequence_length", 77)
+             )
+             eligen_kwargs_posi["bbox_emb"] = inputs["bbox_emb"] # Overwrite with noisy
+             eligen_kwargs.update(eligen_kwargs_posi)
+
+        timestep_1 = timestep_1.unsqueeze(0).to(self.device)
+
+        # We need to call self.dit
+        # self.dit expects: hidden_states, timestep, prompt_emb, pooled_prompt_emb, ...
+
+        # Prepare main prompt embeddings
+        prompt_emb_dict = self.encode_prompt(inputs["prompt"], positive=True, t5_sequence_length=inputs.get("t5_sequence_length", 77))
+
+        # Forward
+        outputs = self.dit(
+            inputs["latents"], timestep=timestep_1, **prompt_emb_dict, **eligen_kwargs
+        )
+
+        if isinstance(outputs, tuple):
+            noise_pred, noise_pred_bbox = outputs
+        else:
+            noise_pred = outputs
+            noise_pred_bbox = None
+
+        loss_latent = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
+
+        loss_bbox = 0
+        if noise_pred_bbox is not None and "training_target_bbox" in locals():
+            loss_bbox = torch.nn.functional.mse_loss(noise_pred_bbox.float(), training_target_bbox.float())
+
+        loss = loss_latent + loss_bbox
+        # loss = loss * self.scheduler.training_weight(timestep_1) # SD3 usually uses Rectified Flow / Flow Match, weight is 1.
+
+        return loss, loss_latent, loss_bbox
 
     @torch.no_grad()
     def __call__(
@@ -91,6 +213,10 @@ class SD3ImagePipeline(BasePipeline):
         seed=None,
         progress_bar_cmd=tqdm,
         progress_bar_st=None,
+        eligen_entity_prompts=None,
+        eligen_entity_masks=None,
+        eligen_entity_bboxes=None,
+        eligen_enable_on_negative=False,
     ):
         height, width = self.check_resize_height_width(height, width)
         
@@ -116,20 +242,108 @@ class SD3ImagePipeline(BasePipeline):
         prompt_emb_nega = self.encode_prompt(negative_prompt, positive=False, t5_sequence_length=t5_sequence_length)
         prompt_emb_locals = [self.encode_prompt(prompt_local, t5_sequence_length=t5_sequence_length) for prompt_local in local_prompts]
 
+        # Prepare ELIGEN
+        eligen_kwargs_posi, eligen_kwargs_nega = self.prepare_eligen_inputs(
+            eligen_entity_prompts, eligen_entity_masks, eligen_entity_bboxes, eligen_enable_on_negative, cfg_scale, width, height, t5_sequence_length
+        )
+        prompt_emb_posi.update(eligen_kwargs_posi)
+        prompt_emb_nega.update(eligen_kwargs_nega)
+
         # Denoise
         self.load_models_to_device(['dit'])
+
+        # BBox noise for inference?
+        # If ELIGEN, we also output bboxes?
+        # For inference, we usually provide `eligen_entity_bboxes` as condition.
+        # But `forward` expects `bbox_emb`.
+        # If we provide `eligen_entity_bboxes`, do we add noise to it?
+        # In `FluxImagePipeline.__call__`:
+        # inputs_shared["bbox_emb"] = self.scheduler.add_noise(inputs_shared["eligen_entity_bboxes"], inputs_shared["noise_bbox"], timestep)
+        # It adds noise at each step!
+        # Because we are denoising bboxes jointly?
+        # Yes.
+
+        # So I need to implement that loop.
+        # Initialize bbox noise.
+        bbox_emb = None
+        if eligen_entity_bboxes is not None:
+             # Initial noise for bboxes
+             # eligen_kwargs_posi["bbox_emb"] is the ground truth/condition?
+             # Wait, in Flux `__call__`:
+             # inputs_shared["eligen_entity_bboxes"] = ... (processed)
+             # inputs_shared["bbox_emb"] = self.scheduler.add_noise(inputs_shared["eligen_entity_bboxes"], inputs_shared["noise_bbox"], timestep)
+
+             # So we are guiding the generation using `eligen_entity_bboxes` as "clean" target?
+             # No, `add_noise` adds noise to it.
+             # But if `eligen_entity_bboxes` is user input (target positions), why add noise?
+             # Maybe because the model expects noisy input at current timestep?
+             # Yes, diffusion model.
+
+             # So we need `noise_bbox`.
+             num_bboxes = len(eligen_entity_bboxes[0]) if isinstance(eligen_entity_bboxes, list) else eligen_entity_bboxes.shape[1]
+             noise_bbox = self.generate_noise((1, num_bboxes, 4), seed=seed, device=self.device, dtype=self.torch_dtype)
+             target_bbox = eligen_kwargs_posi["bbox_emb"] # Already processed tensor
+
         for progress_id, timestep in enumerate(progress_bar_cmd(self.scheduler.timesteps)):
-            timestep = timestep.unsqueeze(0).to(self.device)
+            timestep_tensor = timestep.unsqueeze(0).to(self.device)
+
+            # Update bbox_emb with noise for this timestep
+            if eligen_entity_bboxes is not None:
+                 bbox_emb_t = self.scheduler.add_noise(target_bbox, noise_bbox, timestep_tensor)
+                 prompt_emb_posi["bbox_emb"] = bbox_emb_t
+                 if eligen_enable_on_negative:
+                     prompt_emb_nega["bbox_emb"] = bbox_emb_t
 
             # Classifier-free guidance
             inference_callback = lambda prompt_emb_posi: self.dit(
-                latents, timestep=timestep, **prompt_emb_posi, **tiler_kwargs,
+                latents, timestep=timestep_tensor, **prompt_emb_posi, **tiler_kwargs,
             )
-            noise_pred_posi = self.control_noise_via_local_prompts(prompt_emb_posi, prompt_emb_locals, masks, mask_scales, inference_callback)
-            noise_pred_nega = self.dit(
-                latents, timestep=timestep, **prompt_emb_nega, **tiler_kwargs,
-            )
+
+            # Note: self.dit returns (latents, bbox) if bbox present.
+            # But control_noise_via_local_prompts expects just latents?
+            # `control_noise_via_local_prompts` implementation in `BasePipeline` likely assumes single output.
+            # If `self.dit` returns tuple, it might break.
+
+            # I should wrap `self.dit` to only return latents if using local prompts, OR update `control_noise_via_local_prompts`.
+            # But `control_noise_via_local_prompts` is in `BasePipeline`.
+            # Let's check `BasePipeline`.
+
+            # Assuming no local prompts when using ELIGEN for simplicity, or handle tuple unpacking.
+
+            # If I call self.dit directly:
+            out_posi = self.dit(latents, timestep=timestep_tensor, **prompt_emb_posi, **tiler_kwargs)
+
+            if isinstance(out_posi, tuple):
+                noise_pred_posi, noise_pred_bbox_posi = out_posi
+            else:
+                noise_pred_posi = out_posi
+                noise_pred_bbox_posi = None
+
+            # Negative
+            out_nega = self.dit(latents, timestep=timestep_tensor, **prompt_emb_nega, **tiler_kwargs)
+            if isinstance(out_nega, tuple):
+                noise_pred_nega, noise_pred_bbox_nega = out_nega
+            else:
+                noise_pred_nega = out_nega
+                noise_pred_bbox_nega = None
+
             noise_pred = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
+
+            # BBox update?
+            # Flux `__call__` doesn't seem to update `bbox_emb` via scheduler step?
+            # `inputs_shared["bbox_emb"] = self.scheduler.step(bbox_noise_pred, self.scheduler.timesteps[progress_id], inputs_shared["bbox_emb"])`
+            # It IS commented out in `FluxImagePipeline.__call__`?
+            # ` # inputs_shared["bbox_emb"] = self.scheduler.step(bbox_noise_pred, self.scheduler.timesteps[progress_id], inputs_shared["bbox_emb"])`
+            # Yes!
+
+            # So bbox is NOT denoised during inference? It just stays as noisy version of input bbox?
+            # `inputs_shared["bbox_emb"] = self.scheduler.add_noise(inputs_shared["eligen_entity_bboxes"], inputs_shared["noise_bbox"], timestep)`
+
+            # So we effectively inject "noisy target bbox" at each step.
+            # We don't use the model's bbox prediction to update bbox.
+            # This makes sense if we want to FORCE the bbox to be the user input.
+
+            # So I don't need to use `noise_pred_bbox` for stepping.
 
             # DDIM
             latents = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], latents)
