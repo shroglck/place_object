@@ -8,19 +8,70 @@ from accelerate.utils import DistributedDataParallelKwargs
 import numpy as np
 
 class TextImageDataset(torch.utils.data.Dataset):
-    def __init__(self, dataset_base_path, dataset_metadata_path, steps_per_epoch=10000, height=1024, width=1024, center_crop=True, random_flip=False):
+    def __init__(self, dataset_base_path, dataset_metadata_path, steps_per_epoch=10000, height=1024, width=1024, center_crop=True, random_flip=False, bbox_norm_size=1024, image_extensions=("jpg", "jpeg", "png")):
+        """
+        Supports two metadata formats:
+        1. Per-image JSON: dataset_metadata_path is a directory with {basename}_metadata.json files.
+           dataset_base_path is the images directory. Each JSON has:
+           {"detections": [{"category": "...", "bbox": [x1,y1,x2,y2], "local_prompt": "..."}]}
+           Bbox is in pixel coords for bbox_norm_size x bbox_norm_size images.
+        2. Single .jsonl file: dataset_metadata_path points to a .jsonl with lines containing
+           image_id, caption, entities (list of {entity, bbox} with normalized bbox).
+        """
         self.steps_per_epoch = steps_per_epoch
-        file_path = dataset_metadata_path
-
-        # Read the .jsonl file line by line
-        with open(file_path, "r", encoding="utf-8") as file:
-            data = [json.loads(line) for line in file]
-        
-        self.path = [os.path.join(dataset_base_path, str(file_name["image_id"]).zfill(6)+".png") for file_name in data]
-        self.text = [file["caption"] for file in data]
         self.height = height
         self.width = width
-        self.entity_dict = {file["image_id"]:file["entities"] for file in data }
+        self.bbox_norm_size = bbox_norm_size
+        self.image_extensions = image_extensions
+
+
+        # Per-image JSON: dataset_metadata_path is a directory
+        metadata_dir = dataset_metadata_path
+        images_dir = dataset_base_path
+        self.path = []
+        self.text = []
+        self.entity_dict = {}
+
+        for filename in sorted(os.listdir(metadata_dir)):
+            if not filename.endswith("_metadata.json"):
+                continue
+            basename = filename[:-len("_metadata.json")]
+            metadata_path = os.path.join(metadata_dir, filename)
+
+            # Find corresponding image (try jpg, jpeg, png)
+            image_path = None
+            for ext in self.image_extensions:
+                candidate = os.path.join(images_dir, f"{basename}.{ext}")
+                if os.path.exists(candidate):
+                    image_path = candidate
+                    break
+            if image_path is None:
+                continue
+
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            detections = meta.get("detections", [])
+            if not detections:
+                continue
+
+            # Convert to entity format: {entity, bbox} with normalized bbox
+            entities = []
+            for d in detections:
+                bbox_px = d["bbox"]
+                norm = self.bbox_norm_size
+                bbox_norm = [
+                    bbox_px[0] / norm, bbox_px[1] / norm,
+                    bbox_px[2] / norm, bbox_px[3] / norm
+                ]
+                entities.append({"entity": d["local_prompt"], "bbox": bbox_norm})
+
+            # Caption: use first local_prompt
+            caption = detections[0].get("local_prompt", "")
+            caption = meta.get("global_caption", "")
+
+            self.path.append(image_path)
+            self.text.append(caption)
+            self.entity_dict[basename] = entities
 
     def crop_and_resize(self, image, target_height, target_width):
         width, height = image.size
@@ -42,14 +93,14 @@ class TextImageDataset(torch.utils.data.Dataset):
     def __getitem__(self, index):
         data_id = torch.randint(0, len(self.path), (1,))[0]
         data_id = (data_id + index) % len(self.path) # For fixed seed.
-        image_id = self.path[data_id].split("/")[-1][:-4]
+        image_id = os.path.splitext(os.path.basename(self.path[data_id]))[0]
         entities = self.entity_dict[image_id]
         text = self.text[data_id]
 
         while len(entities) == 0 or not os.path.exists(self.path[data_id]):
             data_id = torch.randint(0, len(self.path), (1,))[0]
             data_id = (data_id + index) % len(self.path) # For fixed seed.
-            image_id = self.path[data_id].split("/")[-1][:-4]
+            image_id = os.path.splitext(os.path.basename(self.path[data_id]))[0]
             entities = self.entity_dict[image_id]
             text = self.text[data_id]
 

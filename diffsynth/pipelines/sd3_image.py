@@ -184,10 +184,10 @@ class SD3ImagePipeline(BasePipeline):
         loss_latent = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
 
         loss_bbox = 0
-        if noise_pred_bbox is not None and "training_target_bbox" in locals():
-            loss_bbox = torch.nn.functional.mse_loss(noise_pred_bbox.float(), training_target_bbox.float())
+        # if noise_pred_bbox is not None and "training_target_bbox" in locals():
+        #     loss_bbox = torch.nn.functional.mse_loss(noise_pred_bbox.float(), training_target_bbox.float())
 
-        loss = loss_latent + loss_bbox
+        loss = loss_latent
         # loss = loss * self.scheduler.training_weight(timestep_1) # SD3 usually uses Rectified Flow / Flow Match, weight is 1.
 
         return loss, loss_latent, loss_bbox
