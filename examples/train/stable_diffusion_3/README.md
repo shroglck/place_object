@@ -50,3 +50,14 @@ accelerate launch examples/train/stable_diffusion_3/train_eligen.py \
 
 - The script assumes the dataset format matches what is expected by `TextImageDataset` for ELIGEN (containing `image_id`, `caption`, `entities` with `bbox` and `entity`).
 - Ensure `diffsynth` is in your PYTHONPATH.
+
+### Out of memory (OOM)
+
+If you hit CUDA OOM, especially on smaller GPUs or with larger batch sizes:
+
+1. **Use `--use_gradient_checkpointing`** (recommended). It is now wired so the SD3 DiT uses activation checkpointing and reduces VRAM at the cost of some speed.
+2. **Lower per-step batch size and use gradient accumulation** to keep the same effective batch size, e.g.:
+   - Effective batch 32 with less memory: `--batch_size 8 --gradient_accumulation_steps 4`
+   - Or: `--batch_size 4 --gradient_accumulation_steps 8`
+3. **If OOM happens with high `--steps_per_epoch`** (e.g. 5000): periodic CUDA cache clearing is enabled by default every 500 steps (`--clear_cuda_cache_every 500`). Set to `0` to disable. Alternatively use fewer steps per epoch and more epochs (e.g. `--steps_per_epoch 1000 --num_epochs 5` instead of 5000 steps in one epoch) to keep total steps the same.
+3. **Use `--lora_target_modules "a_to_qkv,b_to_qkv,a_to_out,b_to_out"`** for this codebase’s SD3 DiT (not `to_q,to_k,to_v,to_out`).

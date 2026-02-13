@@ -8,7 +8,7 @@ from accelerate.utils import DistributedDataParallelKwargs
 import numpy as np
 
 class TextImageDataset(torch.utils.data.Dataset):
-    def __init__(self, dataset_base_path, dataset_metadata_path, steps_per_epoch=10000, height=1024, width=1024, center_crop=True, random_flip=False, bbox_norm_size=1024, image_extensions=("jpg", "jpeg", "png")):
+    def __init__(self, dataset_base_path, dataset_metadata_path, steps_per_epoch=10000, height=1024, width=1024, center_crop=True, random_flip=False, bbox_norm_size=1024, image_extensions=("jpg", "jpeg", "png"), max_files=None):
         """
         Supports two metadata formats:
         1. Per-image JSON: dataset_metadata_path is a directory with {basename}_metadata.json files.
@@ -23,6 +23,7 @@ class TextImageDataset(torch.utils.data.Dataset):
         self.width = width
         self.bbox_norm_size = bbox_norm_size
         self.image_extensions = image_extensions
+        self.max_files = max_files
 
 
         # Per-image JSON: dataset_metadata_path is a directory
@@ -31,8 +32,12 @@ class TextImageDataset(torch.utils.data.Dataset):
         self.path = []
         self.text = []
         self.entity_dict = {}
+        # When not capping files, avoid loading all metadata into RAM (causes high memory / OOM)
+        self.metadata_path = []  # for lazy load when entity_dict is not filled
 
         for filename in sorted(os.listdir(metadata_dir)):
+            if self.max_files is not None and len(self.path) >= self.max_files:
+                break
             if not filename.endswith("_metadata.json"):
                 continue
             basename = filename[:-len("_metadata.json")]
@@ -48,30 +53,31 @@ class TextImageDataset(torch.utils.data.Dataset):
             if image_path is None:
                 continue
 
-            with open(metadata_path, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-            detections = meta.get("detections", [])
-            if not detections:
-                continue
-
-            # Convert to entity format: {entity, bbox} with normalized bbox
-            entities = []
-            for d in detections:
-                bbox_px = d["bbox"]
-                norm = self.bbox_norm_size
-                bbox_norm = [
-                    bbox_px[0] / norm, bbox_px[1] / norm,
-                    bbox_px[2] / norm, bbox_px[3] / norm
-                ]
-                entities.append({"entity": d["local_prompt"], "bbox": bbox_norm})
-
-            # Caption: use first local_prompt
-            caption = detections[0].get("local_prompt", "")
-            caption = meta.get("global_caption", "")
-
             self.path.append(image_path)
-            self.text.append(caption)
-            self.entity_dict[basename] = entities
+            self.metadata_path.append(metadata_path)
+
+            # Only load full metadata into memory when capping files (debug); else lazy-load in __getitem__
+            if self.max_files is not None:
+                with open(metadata_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                detections = meta.get("detections", [])
+                if not detections:
+                    self.path.pop()
+                    self.metadata_path.pop()
+                    continue
+                entities = []
+                for d in detections:
+                    bbox_px = d["bbox"]
+                    norm = self.bbox_norm_size
+                    bbox_norm = [
+                        bbox_px[0] / norm, bbox_px[1] / norm,
+                        bbox_px[2] / norm, bbox_px[3] / norm
+                    ]
+                    entities.append({"entity": d["local_prompt"], "bbox": bbox_norm})
+                caption = detections[0].get("local_prompt", "")
+                caption = meta.get("global_caption", "")
+                self.text.append(caption)
+                self.entity_dict[basename] = entities
 
     def crop_and_resize(self, image, target_height, target_width):
         width, height = image.size
@@ -90,19 +96,42 @@ class TextImageDataset(torch.utils.data.Dataset):
         return height, width
 
 
+    def _load_metadata(self, data_id):
+        """Load caption and entities from metadata file (used when not using max_files)."""
+        with open(self.metadata_path[data_id], "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        detections = meta.get("detections", [])
+        entities = []
+        for d in detections:
+            bbox_px = d["bbox"]
+            norm = self.bbox_norm_size
+            bbox_norm = [
+                bbox_px[0] / norm, bbox_px[1] / norm,
+                bbox_px[2] / norm, bbox_px[3] / norm
+            ]
+            entities.append({"entity": d["local_prompt"], "bbox": bbox_norm})
+        caption = meta.get("global_caption", "") or (detections[0].get("local_prompt", "") if detections else "")
+        return caption, entities
+
     def __getitem__(self, index):
         data_id = torch.randint(0, len(self.path), (1,))[0]
         data_id = (data_id + index) % len(self.path) # For fixed seed.
         image_id = os.path.splitext(os.path.basename(self.path[data_id]))[0]
-        entities = self.entity_dict[image_id]
-        text = self.text[data_id]
+        if image_id in self.entity_dict:
+            entities = self.entity_dict[image_id]
+            text = self.text[data_id]
+        else:
+            text, entities = self._load_metadata(data_id)
 
         while len(entities) == 0 or not os.path.exists(self.path[data_id]):
             data_id = torch.randint(0, len(self.path), (1,))[0]
             data_id = (data_id + index) % len(self.path) # For fixed seed.
             image_id = os.path.splitext(os.path.basename(self.path[data_id]))[0]
-            entities = self.entity_dict[image_id]
-            text = self.text[data_id]
+            if image_id in self.entity_dict:
+                entities = self.entity_dict[image_id]
+                text = self.text[data_id]
+            else:
+                text, entities = self._load_metadata(data_id)
 
 
         image = Image.open(self.path[data_id]).convert("RGB")
@@ -555,6 +584,7 @@ def launch_training_task(
     gradient_accumulation_steps: int = 1,
     find_unused_parameters: bool = False,
     batch_size: int = 1,
+    clear_cuda_cache_every: int = 0,
 ):
     # Custom collate function to handle batching
     def collate_fn(batch):
@@ -646,6 +676,10 @@ def launch_training_task(
                 })
                 
                 global_step += 1
+
+                # Periodic cache clear to reduce GPU fragmentation over long epochs (e.g. 5000 steps)
+                if clear_cuda_cache_every > 0 and (global_step % clear_cuda_cache_every) == 0 and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         
         # End of epoch - update epoch CSV
         if len(epoch_losses) > 0:
@@ -740,6 +774,7 @@ def flux_parser():
     parser.add_argument("--dataset_num_workers", type=int, default=0, help="Number of workers for data loading.")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay.")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for training.")
+    parser.add_argument("--clear_cuda_cache_every", type=int, default=500, help="Clear CUDA cache every N steps to reduce fragmentation (0=disable). Use when OOM with high steps_per_epoch.")
     parser.add_argument("--reflow_loss", default=False, action="store_true", help="Whether to use reflow loss.")
     parser.add_argument("--stage_one", default=False, action="store_true", help="Whether to use stage one.")
     parser.add_argument("--stage_one_checkpoint", type=str, default=None, help="Path to the stage one checkpoint. If provided, stage one will be loaded from this checkpoint.")

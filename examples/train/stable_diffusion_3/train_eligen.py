@@ -10,7 +10,19 @@ import argparse
 # Reuse flux_parser but rename arguments if needed, or just use it as template
 def parse_args():
     parser = flux_parser()
-    # Add any extra args if needed, or override defaults
+    parser.add_argument(
+        "--torch_dtype",
+        type=str,
+        default="bf16",
+        choices=["bf16", "fp16", "fp32"],
+        help="Torch dtype for loading SD3 models.",
+    )
+    parser.add_argument(
+        "--debug_max_files",
+        type=int,
+        default=None,
+        help="Debug only: keep only the first N dataset files.",
+    )
     return parser.parse_args()
 
 class SD3TrainingModule(DiffusionTrainingModule):
@@ -25,6 +37,7 @@ class SD3TrainingModule(DiffusionTrainingModule):
         lora_alpha=None,
         stage_one_checkpoint=None,
         reflow_loss=False,
+        torch_dtype=torch.bfloat16,
     ):
         super().__init__()
         # Load models
@@ -45,13 +58,21 @@ class SD3TrainingModule(DiffusionTrainingModule):
         # So I can use `from_pretrained`.
 
         from diffsynth import ModelManager
-        model_manager = ModelManager()
+        model_manager = ModelManager(torch_dtype=torch_dtype)
         for model_config in model_configs:
             model_config.download_if_necessary()
             model_manager.load_model(
                 model_config.path
             )
         self.pipe = SD3ImagePipeline.from_model_manager(model_manager)
+        self.pipe.use_gradient_checkpointing = use_gradient_checkpointing
+        if self.pipe.denoising_model() is None:
+            raise ValueError(
+                "SD3 denoising model (DiT) was not loaded. "
+                "Please ensure `--model_id_with_origin_paths` includes a compatible SD3 base checkpoint "
+                "(for example `...:sd3_medium.safetensors` with a supported signature, or "
+                "`...:sd3_medium_incl_clips_t5xxlfp16.safetensors`)."
+            )
 
         self.reflow_loss = reflow_loss
 
@@ -168,7 +189,30 @@ class SD3TrainingModule(DiffusionTrainingModule):
 
 if __name__ == "__main__":
     args = parse_args()
-    dataset = TextImageDataset(dataset_base_path=args.dataset_base_path, dataset_metadata_path=args.dataset_metadata_path, steps_per_epoch=args.steps_per_epoch, height=args.height, width=args.width, center_crop=args.center_crop, random_flip=args.random_flip)
+    torch_dtype_map = {
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+        "fp32": torch.float32,
+    }
+    dataset = TextImageDataset(
+        dataset_base_path=args.dataset_base_path,
+        dataset_metadata_path=args.dataset_metadata_path,
+        steps_per_epoch=args.steps_per_epoch,
+        height=args.height,
+        width=args.width,
+        center_crop=args.center_crop,
+        random_flip=args.random_flip,
+        max_files=args.debug_max_files,
+    )
+    if args.debug_max_files is not None:
+        debug_max_files = max(1, int(args.debug_max_files))
+        dataset.path = dataset.path[:debug_max_files]
+        dataset.text = dataset.text[:debug_max_files]
+        kept_image_ids = {os.path.splitext(os.path.basename(p))[0] for p in dataset.path}
+        dataset.entity_dict = {k: v for k, v in dataset.entity_dict.items() if k in kept_image_ids}
+        if len(dataset.path) == 0:
+            raise ValueError("No dataset files left after applying --debug_max_files.")
+        print(f"[Debug] Using {len(dataset.path)} files due to --debug_max_files={debug_max_files}.")
     model = SD3TrainingModule(
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,
@@ -183,6 +227,7 @@ if __name__ == "__main__":
         lora_alpha=args.lora_alpha,
         stage_one_checkpoint=args.stage_one_checkpoint,
         reflow_loss=args.reflow_loss,
+        torch_dtype=torch_dtype_map[args.torch_dtype],
     )
     model_logger = ModelLogger(
         args.output_path,
@@ -201,4 +246,5 @@ if __name__ == "__main__":
         find_unused_parameters=args.find_unused_parameters,
         num_workers=args.dataset_num_workers,
         batch_size=args.batch_size,
+        clear_cuda_cache_every=getattr(args, "clear_cuda_cache_every", 0),
     )

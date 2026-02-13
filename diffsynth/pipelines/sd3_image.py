@@ -3,6 +3,7 @@ from ..prompters import SD3Prompter
 from ..schedulers import FlowMatchScheduler
 from .base import BasePipeline
 import torch
+import inspect
 from tqdm import tqdm
 import numpy as np
 from PIL import Image
@@ -23,6 +24,7 @@ class SD3ImagePipeline(BasePipeline):
         self.vae_decoder: SD3VAEDecoder = None
         self.vae_encoder: SD3VAEEncoder = None
         self.model_names = ['text_encoder_1', 'text_encoder_2', 'text_encoder_3', 'dit', 'vae_decoder', 'vae_encoder']
+        self._warned_unsupported_eligen = False
 
 
     def denoising_model(self):
@@ -70,6 +72,10 @@ class SD3ImagePipeline(BasePipeline):
 
     def prepare_extra_input(self, latents=None):
         return {}
+
+
+    def _dit_forward_param_names(self):
+        return set(inspect.signature(self.dit.forward).parameters.keys())
     
     def prepare_eligen_inputs(self, eligen_entity_prompts, eligen_entity_masks, eligen_entity_bboxes, eligen_enable_on_negative, cfg_scale, width, height, t5_sequence_length=77):
         if eligen_entity_prompts is None or eligen_entity_masks is None or eligen_entity_bboxes is None:
@@ -88,12 +94,17 @@ class SD3ImagePipeline(BasePipeline):
         entity_masks = torch.cat(batch_masks, dim=0)
 
         # Prepare prompts
+        # `SD3Prompter.encode_prompt` currently assumes a single prompt in the T5 branch.
+        # Encode entity prompts one by one, then stack to [B, N, T, C].
         prompt_embs = []
         for batch_prompt in eligen_entity_prompts:
-            prompt_emb, _ = self.prompter.encode_prompt(
-                batch_prompt, device=self.device, t5_sequence_length=t5_sequence_length
-            )
-            prompt_embs.append(prompt_emb.unsqueeze(0))
+            per_entity_embs = []
+            for entity_prompt in batch_prompt:
+                prompt_emb, _ = self.prompter.encode_prompt(
+                    entity_prompt, device=self.device, t5_sequence_length=t5_sequence_length
+                )
+                per_entity_embs.append(prompt_emb)
+            prompt_embs.append(torch.cat(per_entity_embs, dim=0).unsqueeze(0))
         entity_prompt_emb = torch.cat(prompt_embs, dim=0)
 
         # Prepare bboxes
@@ -123,9 +134,12 @@ class SD3ImagePipeline(BasePipeline):
             inputs["bbox_emb"] = self.scheduler.add_noise(inputs["eligen_entity_bboxes"], inputs["noise_bbox"], timestep_1)
             training_target_bbox = self.scheduler.training_target(inputs["eligen_entity_bboxes"], inputs["noise_bbox"], timestep_1)
 
-        # Prepare ELIGEN inputs for forward
+        # Prepare ELIGEN inputs for forward.
+        # Some SD3 backbones in this repo do not support ELIGEN kwargs.
         eligen_kwargs = {}
-        if "eligen_entity_prompts" in inputs and "eligen_entity_masks" in inputs and "bbox_emb" in inputs:
+        dit_forward_params = self._dit_forward_param_names()
+        supports_eligen_kwargs = "entity_prompt_emb" in dit_forward_params
+        if "eligen_entity_prompts" in inputs and "eligen_entity_masks" in inputs and "bbox_emb" in inputs and supports_eligen_kwargs:
              eligen_kwargs_posi, _ = self.prepare_eligen_inputs(
                  inputs["eligen_entity_prompts"],
                  inputs["eligen_entity_masks"],
@@ -161,8 +175,12 @@ class SD3ImagePipeline(BasePipeline):
              )
              eligen_kwargs_posi["bbox_emb"] = inputs["bbox_emb"] # Overwrite with noisy
              eligen_kwargs.update(eligen_kwargs_posi)
+        elif "eligen_entity_prompts" in inputs and "eligen_entity_masks" in inputs and "bbox_emb" in inputs and not self._warned_unsupported_eligen:
+            print("Warning: current SD3 DiT does not support ELIGEN kwargs; training without ELIGEN conditioning.")
+            self._warned_unsupported_eligen = True
 
-        timestep_1 = timestep_1.unsqueeze(0).to(self.device)
+        # SD3DiT expects a 1D timestep tensor.
+        timestep_1 = timestep_1.reshape(-1).to(self.device)
 
         # We need to call self.dit
         # self.dit expects: hidden_states, timestep, prompt_emb, pooled_prompt_emb, ...
@@ -170,9 +188,11 @@ class SD3ImagePipeline(BasePipeline):
         # Prepare main prompt embeddings
         prompt_emb_dict = self.encode_prompt(inputs["prompt"], positive=True, t5_sequence_length=inputs.get("t5_sequence_length", 77))
 
-        # Forward
+        # Forward (use_gradient_checkpointing reduces VRAM at the cost of speed)
+        use_gc = getattr(self, "use_gradient_checkpointing", False)
         outputs = self.dit(
-            inputs["latents"], timestep=timestep_1, **prompt_emb_dict, **eligen_kwargs
+            inputs["latents"], timestep=timestep_1, **prompt_emb_dict, **eligen_kwargs,
+            use_gradient_checkpointing=use_gc,
         )
 
         if isinstance(outputs, tuple):
@@ -183,7 +203,7 @@ class SD3ImagePipeline(BasePipeline):
 
         loss_latent = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
 
-        loss_bbox = 0
+        loss_bbox = torch.zeros((), device=loss_latent.device, dtype=loss_latent.dtype)
         # if noise_pred_bbox is not None and "training_target_bbox" in locals():
         #     loss_bbox = torch.nn.functional.mse_loss(noise_pred_bbox.float(), training_target_bbox.float())
 
@@ -243,11 +263,14 @@ class SD3ImagePipeline(BasePipeline):
         prompt_emb_locals = [self.encode_prompt(prompt_local, t5_sequence_length=t5_sequence_length) for prompt_local in local_prompts]
 
         # Prepare ELIGEN
-        eligen_kwargs_posi, eligen_kwargs_nega = self.prepare_eligen_inputs(
-            eligen_entity_prompts, eligen_entity_masks, eligen_entity_bboxes, eligen_enable_on_negative, cfg_scale, width, height, t5_sequence_length
-        )
-        prompt_emb_posi.update(eligen_kwargs_posi)
-        prompt_emb_nega.update(eligen_kwargs_nega)
+        dit_forward_params = self._dit_forward_param_names()
+        supports_eligen_kwargs = "entity_prompt_emb" in dit_forward_params
+        if supports_eligen_kwargs:
+            eligen_kwargs_posi, eligen_kwargs_nega = self.prepare_eligen_inputs(
+                eligen_entity_prompts, eligen_entity_masks, eligen_entity_bboxes, eligen_enable_on_negative, cfg_scale, width, height, t5_sequence_length
+            )
+            prompt_emb_posi.update(eligen_kwargs_posi)
+            prompt_emb_nega.update(eligen_kwargs_nega)
 
         # Denoise
         self.load_models_to_device(['dit'])
