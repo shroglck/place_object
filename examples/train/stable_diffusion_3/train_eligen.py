@@ -3,6 +3,7 @@ from diffsynth import load_state_dict
 from diffsynth.pipelines.sd3_image import SD3ImagePipeline
 from diffsynth.trainers.utils import DiffusionTrainingModule, TextImageDataset, ModelLogger, launch_training_task, flux_parser
 from diffsynth.utils import ModelConfig
+from diffsynth import ModelManager
 from torch.nn import init
 from safetensors import safe_open
 import argparse
@@ -36,10 +37,10 @@ class SD3TrainingModule(DiffusionTrainingModule):
         extra_inputs=None,
         lora_alpha=None,
         stage_one_checkpoint=None,
-        reflow_loss=False,
         torch_dtype=torch.bfloat16,
     ):
         super().__init__()
+
         # Load models
         model_configs = []
         if model_paths is not None:
@@ -49,23 +50,18 @@ class SD3TrainingModule(DiffusionTrainingModule):
             model_id_with_origin_paths = model_id_with_origin_paths.split(",")
             model_configs += [ModelConfig(model_id=i.split(":")[0], origin_file_pattern=i.split(":")[1]) for i in model_id_with_origin_paths]
 
-        # Initialize pipeline
-        # Assuming we can load from pretrained using configs
-        # SD3ImagePipeline.from_pretrained expects model_configs
-        # But SD3ImagePipeline definition I see earlier has `from_model_manager`.
-        # I should check `SD3ImagePipeline.from_pretrained` (inherited from BasePipeline?).
-        # BasePipeline has `from_pretrained`.
-        # So I can use `from_pretrained`.
-
-        from diffsynth import ModelManager
         model_manager = ModelManager(torch_dtype=torch_dtype)
         for model_config in model_configs:
             model_config.download_if_necessary()
             model_manager.load_model(
-                model_config.path
+                model_config.path, 
+                device="cpu",
+                torch_dtype=torch_dtype
             )
+
         self.pipe = SD3ImagePipeline.from_model_manager(model_manager)
         self.pipe.use_gradient_checkpointing = use_gradient_checkpointing
+
         if self.pipe.denoising_model() is None:
             raise ValueError(
                 "SD3 denoising model (DiT) was not loaded. "
@@ -74,19 +70,16 @@ class SD3TrainingModule(DiffusionTrainingModule):
                 "`...:sd3_medium_incl_clips_t5xxlfp16.safetensors`)."
             )
 
-        self.reflow_loss = reflow_loss
-
         # Reset training scheduler
         self.pipe.scheduler.set_timesteps(1000, training=True)
 
-        # Freeze parameters
+        # Freeze all parameters first so DDP with find_unused_parameters=False
+        # only tracks the intended trainable subset.
+        self.pipe.requires_grad_(False)
         self.pipe.denoising_model().train()
-        for param in self.pipe.denoising_model().parameters():
-            param.requires_grad = False
 
         # Add LoRA to the base models
         if lora_base_model is not None:
-            # lora_base_model should be "dit" usually
             target_model = getattr(self.pipe, lora_base_model)
             model = self.add_lora_to_model(
                 target_model,
@@ -94,37 +87,16 @@ class SD3TrainingModule(DiffusionTrainingModule):
                 lora_rank=lora_rank,
                 lora_alpha=lora_alpha
             )
-            # setattr(self.pipe, lora_base_model, model) # inject_adapter_in_model modifies in place usually?
-            # `add_lora_to_model` in DiffusionTrainingModule returns modified model.
-            # But `inject_adapter_in_model` modifies module in place?
-            # Yes. But let's set it to be safe.
             setattr(self.pipe, lora_base_model, model)
-
-        # Unfreeze and initialize ELIGEN parameters
-        # patterns = ["bbox"] # BBox embedder and final layer
-        # SD3DiT has `bbox_embedder` and `final_bbox_out`.
-        # Also need to unfreeze LoRA params.
 
         for name, param in self.pipe.dit.named_parameters():
             if "lora_" in name:
                 param.requires_grad = True
-                param.data = param.to(torch.float32)
-            if "bbox_" in name or "final_bbox_out" in name:
-                param.requires_grad = True
-                param.data = param.to(torch.float32)
-
-                # Initialize bbox params if needed (xavier)
-                if "weight" in name and ("bbox_embedder" in name or "final_bbox_out" in name):
-                     if len(param.shape) > 1:
-                        init.xavier_normal_(param)
-                     else:
-                        init.zeros_(param)
+                param.data = param.to(torch_dtype)
 
         if lora_checkpoint is not None:
             # Load LoRA checkpoint
             state_dict = load_state_dict(lora_checkpoint)
-            # state_dict = self.mapping_lora_state_dict(state_dict) # Depending on format
-            # Use `DiffusionTrainingModule.mapping_lora_state_dict` if format matches
             load_result = self.pipe.dit.load_state_dict(state_dict, strict=False)
             print(f"LoRA checkpoint loaded: {lora_checkpoint}")
 
@@ -148,31 +120,29 @@ class SD3TrainingModule(DiffusionTrainingModule):
         images = torch.cat(images, dim=0)
 
         # Encode image
-        # SD3 VAE encoding
-        # We need to make sure we don't track gradients here
         with torch.no_grad():
              inputs["input_latents"] = self.pipe.encode_image(images)
 
         # Noise
         inputs["noise"] = torch.randn_like(inputs["input_latents"])
 
+        eligen_entity_masks = []
+        eligen_entity_prompts = []
+        for i in range(len(data["prompt"])):
+            eligen_entity_mask = []
+            eligen_entity_prompt = []
+            for j in range(max(data["num_entities"])):
+                eligen_entity_mask.append(data["eligen_entity_masks"][i][j])
+                eligen_entity_prompt.append(data["eligen_entity_prompts"][i][j])
+            eligen_entity_masks.append(eligen_entity_mask)
+            eligen_entity_prompts.append(eligen_entity_prompt)
+        
+        data["eligen_entity_masks"] = eligen_entity_masks
+        data["eligen_entity_prompts"] = eligen_entity_prompts
+
         # ELIGEN inputs
         inputs["eligen_entity_masks"] = data["eligen_entity_masks"]
         inputs["eligen_entity_prompts"] = data["eligen_entity_prompts"]
-
-        # BBoxes
-        bboxes = []
-        for i in range(len(data["prompt"])):
-             batch_bboxes = []
-             for j in range(len(data["eligen_entity_bboxes"][i])):
-                 batch_bboxes.append(data["eligen_entity_bboxes"][i][j])
-             bboxes.append(np.array(batch_bboxes))
-        bboxes = np.array(bboxes)
-        bboxes = 2 * bboxes - 1
-        inputs["eligen_entity_bboxes"] = bboxes
-
-        # BBox noise
-        inputs["noise_bbox"] = torch.randn(bboxes.shape).to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
 
         inputs["width"] = data["image"][0].size[0]
         inputs["height"] = data["image"][0].size[1]
@@ -182,8 +152,8 @@ class SD3TrainingModule(DiffusionTrainingModule):
 
     def forward(self, data, inputs=None):
         if inputs is None: inputs = self.forward_preprocess(data)
-        loss, loss_latent, loss_bbox = self.pipe.training_loss(**inputs)
-        return loss, loss_latent, loss_bbox
+        loss, loss_latent = self.pipe.training_loss(**inputs)
+        return loss, loss_latent
 
 
 
@@ -194,6 +164,7 @@ if __name__ == "__main__":
         "fp16": torch.float16,
         "fp32": torch.float32,
     }
+
     dataset = TextImageDataset(
         dataset_base_path=args.dataset_base_path,
         dataset_metadata_path=args.dataset_metadata_path,
@@ -204,6 +175,7 @@ if __name__ == "__main__":
         random_flip=args.random_flip,
         max_files=args.debug_max_files,
     )
+
     if args.debug_max_files is not None:
         debug_max_files = max(1, int(args.debug_max_files))
         dataset.path = dataset.path[:debug_max_files]
@@ -213,6 +185,7 @@ if __name__ == "__main__":
         if len(dataset.path) == 0:
             raise ValueError("No dataset files left after applying --debug_max_files.")
         print(f"[Debug] Using {len(dataset.path)} files due to --debug_max_files={debug_max_files}.")
+    
     model = SD3TrainingModule(
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,
@@ -226,13 +199,13 @@ if __name__ == "__main__":
         extra_inputs=args.extra_inputs,
         lora_alpha=args.lora_alpha,
         stage_one_checkpoint=args.stage_one_checkpoint,
-        reflow_loss=args.reflow_loss,
         torch_dtype=torch_dtype_map[args.torch_dtype],
     )
+
     model_logger = ModelLogger(
         args.output_path,
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
-        state_dict_converter=lambda x:x, # No specific converter for now
+        state_dict_converter=lambda x:x,
     )
 
     optimizer = torch.optim.AdamW(model.trainable_modules(), lr=args.learning_rate, weight_decay=args.weight_decay, fused=True)

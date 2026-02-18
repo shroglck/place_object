@@ -32,7 +32,6 @@ class TextImageDataset(torch.utils.data.Dataset):
         self.path = []
         self.text = []
         self.entity_dict = {}
-        # When not capping files, avoid loading all metadata into RAM (causes high memory / OOM)
         self.metadata_path = []  # for lazy load when entity_dict is not filled
 
         for filename in sorted(os.listdir(metadata_dir)):
@@ -74,7 +73,6 @@ class TextImageDataset(torch.utils.data.Dataset):
                         bbox_px[2] / norm, bbox_px[3] / norm
                     ]
                     entities.append({"entity": d["local_prompt"], "bbox": bbox_norm})
-                caption = detections[0].get("local_prompt", "")
                 caption = meta.get("global_caption", "")
                 self.text.append(caption)
                 self.entity_dict[basename] = entities
@@ -110,13 +108,14 @@ class TextImageDataset(torch.utils.data.Dataset):
                 bbox_px[2] / norm, bbox_px[3] / norm
             ]
             entities.append({"entity": d["local_prompt"], "bbox": bbox_norm})
-        caption = meta.get("global_caption", "") or (detections[0].get("local_prompt", "") if detections else "")
+        caption = meta.get("global_caption", "")
         return caption, entities
 
     def __getitem__(self, index):
         data_id = torch.randint(0, len(self.path), (1,))[0]
         data_id = (data_id + index) % len(self.path) # For fixed seed.
         image_id = os.path.splitext(os.path.basename(self.path[data_id]))[0]
+
         if image_id in self.entity_dict:
             entities = self.entity_dict[image_id]
             text = self.text[data_id]
@@ -127,6 +126,7 @@ class TextImageDataset(torch.utils.data.Dataset):
             data_id = torch.randint(0, len(self.path), (1,))[0]
             data_id = (data_id + index) % len(self.path) # For fixed seed.
             image_id = os.path.splitext(os.path.basename(self.path[data_id]))[0]
+
             if image_id in self.entity_dict:
                 entities = self.entity_dict[image_id]
                 text = self.text[data_id]
@@ -139,10 +139,11 @@ class TextImageDataset(torch.utils.data.Dataset):
         target_height, target_width = self.height, self.width
         width, height = image.size
         scale = max(target_width / width, target_height / height)
+
         entity_prompts = []
         masks = []
         bboxes = []
-        num_entities = min(10, len(entities))
+        num_entities = len(entities)
 
         for entity in entities:
             entity_prompts.append(entity["entity"])
@@ -152,21 +153,19 @@ class TextImageDataset(torch.utils.data.Dataset):
             # Convert numpy array to PIL Image
             mask_pil = Image.fromarray(mask, mode='RGB')
             masks.append(mask_pil)
-            bboxes.append(np.array(bbox))
 
-        remaining  = max(0, 10-len(masks))
+        remaining  = max(0, 20-len(masks))
         for i in range(remaining):
             # Create empty PIL Image instead of numpy array
             empty_mask = Image.new('RGB', (target_width, target_height), (0, 0, 0))
             masks.append(empty_mask)
             entity_prompts.append("<pad>")
-            bboxes.append(np.array([0,0,0,0]))
         
-        return {"prompt": text, "image": image,"eligen_entity_masks":masks[:10],"eligen_entity_prompts":entity_prompts[:10],"eligen_entity_bboxes":bboxes[:10], "num_entities":num_entities}
+        return {"prompt": text, "image": image,"eligen_entity_masks":masks[:20],"eligen_entity_prompts":entity_prompts[:20],"eligen_entity_bboxes":bboxes[:20], "num_entities":num_entities}
 
 
     def __len__(self):
-        return self.steps_per_epoch
+        return len(self.path)
 
 class ImageDataset(torch.utils.data.Dataset):
     def __init__(
@@ -604,26 +603,25 @@ def launch_training_task(
         num_workers=num_workers,
         batch_size=batch_size
     )
-    fsdp_plugin = FullyShardedDataParallelPlugin(
-        fsdp_version=2,
-        auto_wrap_policy="TRANSFORMER_BASED_WRAP",
-        transformer_cls_names_to_wrap=["FluxSingleTransformerBlock", "FluxJointTransformerBlock"],
-        state_dict_type="sharded_state_dict",
-        reshard_after_forward=True,
-        ignored_modules=[model.pipe.text_encoder_1, model.pipe.text_encoder_2, model.pipe.vae_encoder, model.pipe.vae_decoder],
-        min_num_params=1_000_000,
+
+    ddp_kwargs = DistributedDataParallelKwargs(
+        find_unused_parameters=False,
+        broadcast_buffers=False,
+        gradient_as_bucket_view=True,
     )
     accelerator = Accelerator(
         gradient_accumulation_steps=gradient_accumulation_steps,
-        kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=find_unused_parameters)],
-        fsdp_plugin=fsdp_plugin,
+        kwargs_handlers=[ddp_kwargs],
         mixed_precision='bf16',
     )
     model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
-    
-    # manually move pipe to model device
-    model.pipe.device = accelerator.device
-    model.pipe.torch_dtype = torch.bfloat16
+
+    # Keep pipeline device aligned with this rank's accelerator device.
+    # This avoids accidental cross-rank placement (e.g. all ranks using cuda:0).
+    unwrapped_model = accelerator.unwrap_model(model)
+    if hasattr(unwrapped_model, "pipe") and hasattr(unwrapped_model.pipe, "device"):
+        unwrapped_model.pipe.device = accelerator.device
+
     # Initialize CSV files for real-time logging
     os.makedirs(model_logger.output_path, exist_ok=True)
     step_csv_path = os.path.join(model_logger.output_path, "step_loss_history.csv")
@@ -631,24 +629,24 @@ def launch_training_task(
     
     # Create CSV headers
     with open(step_csv_path, "w", newline="") as f:
-        f.write("step,loss,loss_latent,loss_bbox,lr\n")
+        f.write("step,loss,loss_latent,lr\n")
     with open(epoch_csv_path, "w", newline="") as f:
-        f.write("epoch,avg_loss,avg_loss_latent,avg_loss_bbox\n")
+        f.write("epoch,avg_loss,avg_loss_latent\n")
     
     global_step = 0
     
     for epoch_id in range(num_epochs):
         epoch_losses = []
         epoch_loss_latents = []
-        epoch_loss_bboxes = []
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch_id+1}/{num_epochs}")
         
         for step, data in enumerate(progress_bar):
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
-                loss, loss_latent, loss_bbox = model(data)
+                loss, loss_latent = model(data)
                 accelerator.backward(loss)
-                accelerator.clip_grad_norm_(model.trainable_modules(), max_norm=1.0)
+                trainable_params = accelerator.unwrap_model(model).trainable_modules()
+                accelerator.clip_grad_norm_(trainable_params, max_norm=1.0)
                 optimizer.step()
                 model_logger.on_step_end(accelerator, model, save_steps)
                 scheduler.step()
@@ -657,21 +655,18 @@ def launch_training_task(
                 loss_value = loss.detach().item()
                 epoch_losses.append(loss_value)
                 epoch_loss_latents.append(loss_latent.detach().item())
-                epoch_loss_bboxes.append(loss_bbox.detach().item())
 
                 # Update step CSV in real-time
                 with open(step_csv_path, "a", newline="") as f:
-                    f.write(f"{global_step},{loss_value},{loss_latent.item()},{loss_bbox.item()},{scheduler.get_last_lr()[0]}\n")
+                    f.write(f"{global_step},{loss_value},{loss_latent.item()},{scheduler.get_last_lr()[0]}\n")
                 
                 # Update progress bar with current loss
                 avg_loss = sum(epoch_losses) / len(epoch_losses)
                 epoch_avg_loss_latent = sum(epoch_loss_latents) / len(epoch_loss_latents)
-                epoch_avg_loss_bbox = sum(epoch_loss_bboxes) / len(epoch_loss_bboxes)
                 progress_bar.set_postfix({
                     'loss': f'{loss_value:.4f}',
                     'avg_loss': f'{avg_loss:.4f}',
                     'loss_latent': f'{loss_latent.item():.4f}',
-                    'loss_bbox': f'{loss_bbox.item():.4f}',
                     'lr': f'{scheduler.get_last_lr()[0]:.2e}'
                 })
                 
@@ -685,7 +680,7 @@ def launch_training_task(
         if len(epoch_losses) > 0:
             epoch_avg_loss = sum(epoch_losses) / len(epoch_losses)
             with open(epoch_csv_path, "a", newline="") as f:
-                f.write(f"{epoch_id},{epoch_avg_loss},{epoch_avg_loss_latent},{epoch_avg_loss_bbox}\n")
+                f.write(f"{epoch_id},{epoch_avg_loss},{epoch_avg_loss_latent}\n")
         
         if save_steps is None:
             model_logger.on_epoch_end(accelerator, model, epoch_id)
