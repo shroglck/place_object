@@ -112,8 +112,9 @@ class TextImageDataset(torch.utils.data.Dataset):
         return caption, entities
 
     def __getitem__(self, index):
-        data_id = torch.randint(0, len(self.path), (1,))[0]
-        data_id = (data_id + index) % len(self.path) # For fixed seed.
+        # data_id = torch.randint(0, len(self.path), (1,))[0]
+        # data_id = (data_id + index) % len(self.path) # For fixed seed.
+        data_id = index
         image_id = os.path.splitext(os.path.basename(self.path[data_id]))[0]
 
         if image_id in self.entity_dict:
@@ -124,7 +125,7 @@ class TextImageDataset(torch.utils.data.Dataset):
 
         while len(entities) == 0 or not os.path.exists(self.path[data_id]):
             data_id = torch.randint(0, len(self.path), (1,))[0]
-            data_id = (data_id + index) % len(self.path) # For fixed seed.
+            # data_id = (data_id + index) % len(self.path) # For fixed seed.
             image_id = os.path.splitext(os.path.basename(self.path[data_id]))[0]
 
             if image_id in self.entity_dict:
@@ -163,6 +164,87 @@ class TextImageDataset(torch.utils.data.Dataset):
         
         return {"prompt": text, "image": image,"eligen_entity_masks":masks[:20],"eligen_entity_prompts":entity_prompts[:20],"eligen_entity_bboxes":bboxes[:20], "num_entities":num_entities}
 
+
+    def __len__(self):
+        return len(self.path)
+
+# class TextImageDataset(torch.utils.data.Dataset):
+#     def __init__(self, dataset_base_path, dataset_metadata_path, steps_per_epoch=10000, height=1024, width=1024, center_crop=True, random_flip=False):
+#         self.steps_per_epoch = steps_per_epoch
+#         file_path = dataset_metadata_path
+
+#         # Read the .jsonl file line by line
+#         with open(file_path, "r", encoding="utf-8") as file:
+#             data = [json.loads(line) for line in file]
+        
+#         self.path = [os.path.join(dataset_base_path, str(file_name["image_id"]).zfill(6)+".png") for file_name in data]
+#         self.text = [file["caption"] for file in data]
+#         self.height = height
+#         self.width = width
+#         self.entity_dict = {file["image_id"]:file["entities"] for file in data }
+
+#     def crop_and_resize(self, image, target_height, target_width):
+#         width, height = image.size
+#         scale = max(target_width / width, target_height / height)
+#         image = torchvision.transforms.functional.resize(
+#             image,
+#             (round(height*scale), round(width*scale)),
+#             interpolation=torchvision.transforms.InterpolationMode.BILINEAR
+#         )
+#         image = torchvision.transforms.functional.center_crop(image, (target_height, target_width))
+#         return image
+    
+    
+#     def get_height_width(self):
+#         height, width = self.height, self.width
+#         return height, width
+
+
+#     def __getitem__(self, index):
+#         data_id = index
+#         # data_id = torch.randint(0, len(self.path), (1,))[0]
+#         # data_id = (data_id + index) % len(self.path) # For fixed seed.
+#         image_id = self.path[data_id].split("/")[-1][:-4]
+#         entities = self.entity_dict[image_id]
+#         text = self.text[data_id]
+
+#         while len(entities) == 0 or not os.path.exists(self.path[data_id]):
+#             data_id = torch.randint(0, len(self.path), (1,))[0]
+#             # data_id = (data_id + index) % len(self.path) # For fixed seed.
+#             image_id = self.path[data_id].split("/")[-1][:-4]
+#             entities = self.entity_dict[image_id]
+#             text = self.text[data_id]
+
+
+#         image = Image.open(self.path[data_id]).convert("RGB")
+#         image = self.crop_and_resize(image, *self.get_height_width())
+#         target_height, target_width = self.height, self.width
+#         width, height = image.size
+#         scale = max(target_width / width, target_height / height)
+#         entity_prompts = []
+#         masks = []
+#         num_entities = 0
+
+#         for entity in entities:
+#             bbox = entity['bbox']
+#             if len(bbox) != 4:
+#                 continue
+#             entity_prompts.append(entity["entity"])
+#             mask = np.zeros((target_height,target_width,3), dtype=np.uint8)
+#             mask[int(bbox[1]*target_height):int(bbox[3]*target_height),int(bbox[0]*target_width):int(bbox[2]*target_width),:] = 255
+#             # Convert numpy array to PIL Image
+#             mask_pil = Image.fromarray(mask, mode='RGB')
+#             masks.append(mask_pil)
+#             num_entities += 1
+
+#         remaining  = max(0, 20-len(masks))
+#         for i in range(remaining):
+#             # Create empty PIL Image instead of numpy array
+#             empty_mask = Image.new('RGB', (target_width, target_height), (0, 0, 0))
+#             masks.append(empty_mask)
+#             entity_prompts.append("<pad>")
+        
+#         return {"prompt": text, "image": image,"eligen_entity_masks":masks[:20],"eligen_entity_prompts":entity_prompts[:20], "num_entities":num_entities}
 
     def __len__(self):
         return len(self.path)

@@ -229,7 +229,7 @@ class SD3ImagePipeline(BasePipeline):
         # Prepare ELIGEN
         dit_forward_params = self._dit_forward_param_names()
         supports_eligen_kwargs = "entity_prompt_emb" in dit_forward_params
-        if supports_eligen_kwargs:
+        if supports_eligen_kwargs and eligen_entity_prompts is not None and eligen_entity_masks is not None:
             eligen_kwargs_posi, eligen_kwargs_nega = self.prepare_eligen(
                 prompt_emb_nega=prompt_emb_nega,
                 eligen_entity_prompts=eligen_entity_prompts,

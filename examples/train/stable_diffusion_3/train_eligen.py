@@ -1,4 +1,7 @@
-import torch, os, json, numpy as np
+import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import torch, json, numpy as np
 from diffsynth import load_state_dict
 from diffsynth.pipelines.sd3_image import SD3ImagePipeline
 from diffsynth.trainers.utils import DiffusionTrainingModule, TextImageDataset, ModelLogger, launch_training_task, flux_parser
@@ -11,6 +14,7 @@ import argparse
 # Reuse flux_parser but rename arguments if needed, or just use it as template
 def parse_args():
     parser = flux_parser()
+    parser.set_defaults(use_gradient_checkpointing=True, clear_cuda_cache_every=100)
     parser.add_argument(
         "--torch_dtype",
         type=str,
@@ -173,7 +177,7 @@ if __name__ == "__main__":
         width=args.width,
         center_crop=args.center_crop,
         random_flip=args.random_flip,
-        max_files=args.debug_max_files,
+        # max_files=args.debug_max_files,
     )
 
     if args.debug_max_files is not None:

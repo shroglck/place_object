@@ -4,6 +4,8 @@ from .svd_unet import TemporalTimesteps
 from .tiler import TileWorker
 import torch.nn as nn
 import numpy as np
+import os
+from PIL import Image
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim, eps, elementwise_affine=True):
@@ -353,11 +355,11 @@ class SD3DiT(torch.nn.Module):
         self.proj_out = torch.nn.Linear(embed_dim, 64)
 
     def patchify(self, hidden_states):
-        hidden_states = rearrange(hidden_states, "B C (H P) (W Q) -> B (H W) (C P Q)", P=2, Q=2)
+        hidden_states = rearrange(hidden_states, "B C (H P) (W Q) -> B (H W) (P Q C)", P=2, Q=2)
         return hidden_states
 
     def unpatchify(self, hidden_states, height, width):
-        hidden_states = rearrange(hidden_states, "B (H W) (C P Q) -> B C (H P) (W Q)", P=2, Q=2, H=height//2, W=width//2)
+        hidden_states = rearrange(hidden_states, "B (H W) (P Q C) -> B C (H P) (W Q)", P=2, Q=2, H=height//2, W=width//2)
         return hidden_states
 
     @torch.no_grad()
@@ -465,6 +467,10 @@ class SD3DiT(torch.nn.Module):
 
         if entity_prompt_emb is not None and entity_masks is not None:
              prompt_emb, attention_mask = self.process_entity_masks(hidden_states, prompt_emb, entity_prompt_emb, entity_masks)
+             # Visualize allowed entries (finite values) as white.
+            #  mask_image = torch.isfinite(attention_mask[0, 0]).to(torch.uint8).cpu().numpy() * 255
+            #  Image.fromarray(mask_image, mode="L").save("sd3_attention_mask.png")
+             attention_mask = attention_mask.to(hidden_states.dtype)
         else:
              prompt_emb = self.context_embedder(prompt_emb)
              attention_mask = None
