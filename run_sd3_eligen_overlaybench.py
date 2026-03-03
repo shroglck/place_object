@@ -2,6 +2,7 @@ import os
 from ast import literal_eval
 
 import torch
+from accelerate import Accelerator
 from datasets import load_dataset
 from PIL import Image, ImageDraw
 from tqdm import tqdm
@@ -15,7 +16,7 @@ from diffsynth.utils import ModelConfig
 # --------------------------
 DATASET_NAME = "cywang143/OverLayBench_Eval"
 SPLITS = ["simple", "medium", "hard"]
-OUTPUT_ROOT = "/mnt/sphere/nvme-backups/luogeng/shivansh/place_object/sd3_eligen_ours_overlaybench"
+OUTPUT_ROOT = "/mnt/sphere/nvme-backups/luogeng/shivansh/place_object/sd3_eligen_overlaybench"
 SEEDS = [0]
 HEIGHT = 1024
 WIDTH = 1024
@@ -32,7 +33,7 @@ MODEL_ID_WITH_ORIGIN_PATHS = (
     "AI-ModelScope/stable-diffusion-3-medium:text_encoders/t5xxl_fp16.safetensors"
 )
 LORA_PATH = (
-    "/mnt/sphere/nvme-backups/luogeng/shivansh/place_object/models/sd3_eligen_ours/"
+    "/mnt/sphere/nvme-backups/luogeng/shivansh/place_object/models/sd3_eligen/"
     "SD3-EliGen_lora/step-10000.safetensors"
 )
 
@@ -90,57 +91,81 @@ def format_filename(image_id, fallback_idx):
     return f"{safe}.png"
 
 
-def load_pipe():
+def load_pipe(device):
     model_configs = [
         ModelConfig(model_id=item.split(":")[0], origin_file_pattern=item.split(":")[1])
         for item in MODEL_ID_WITH_ORIGIN_PATHS.split(",")
     ]
-    model_manager = ModelManager(torch_dtype=TORCH_DTYPE, device=DEVICE)
+    model_manager = ModelManager(torch_dtype=TORCH_DTYPE, device=str(device))
 
     for model_config in model_configs:
         model_config.download_if_necessary()
-        model_manager.load_model(model_config.path, device=DEVICE, torch_dtype=TORCH_DTYPE)
+        model_manager.load_model(model_config.path, device=str(device), torch_dtype=TORCH_DTYPE)
 
     model_manager.load_lora(LORA_PATH, lora_alpha=1.0)
     return SD3ImagePipeline.from_model_manager(model_manager)
 
-os.makedirs(OUTPUT_ROOT, exist_ok=True)
-pipe = load_pipe()
+def main():
+    accelerator = Accelerator()
+    rank = accelerator.process_index
+    world_size = accelerator.num_processes
 
-for split in SPLITS:
-    print(f"Loading split: {split}")
-    dataset = load_dataset(DATASET_NAME, split=split)
+    if accelerator.is_main_process:
+        os.makedirs(OUTPUT_ROOT, exist_ok=True)
+    accelerator.wait_for_everyone()
 
-    split_root = os.path.join(OUTPUT_ROOT, split)
-    os.makedirs(split_root, exist_ok=True)
+    pipe = load_pipe(accelerator.device if DEVICE == "cuda" else DEVICE)
 
-    for idx, sample in enumerate(tqdm(dataset, desc=f"Generating {split}")):
-        image_id = sample.get("image_id", idx)
-        filename = format_filename(image_id, idx)
+    for split in SPLITS:
+        accelerator.print(f"Loading split: {split}")
+        dataset = load_dataset(DATASET_NAME, split=split)
 
-        try:
-            caption, entity_prompts, masks = build_inputs(sample)
-            if not entity_prompts:
-                print(f"[{split}] skip {filename}: no valid entities")
+        split_root = os.path.join(OUTPUT_ROOT, split)
+        os.makedirs(split_root, exist_ok=True)
+
+        shard_indices = list(range(rank, len(dataset), world_size))
+        progress = tqdm(
+            shard_indices,
+            desc=f"Generating {split} [rank {rank}]",
+            disable=not accelerator.is_local_main_process,
+        )
+
+        for idx in progress:
+            sample = dataset[idx]
+            image_id = sample.get("image_id", idx)
+            filename = format_filename(image_id, idx)
+
+            try:
+                caption, entity_prompts, masks = build_inputs(sample)
+                if not entity_prompts:
+                    accelerator.print(f"[{split}] skip {filename}: no valid entities")
+                    continue
+            except Exception as exc:
+                accelerator.print(f"[{split}] skip {filename}: {exc}")
                 continue
-        except Exception as exc:
-            print(f"[{split}] skip {filename}: {exc}")
-            continue
 
-        for seed in SEEDS:
-            seed_dir = os.path.join(split_root, f"seed_{seed}")
-            os.makedirs(seed_dir, exist_ok=True)
-            out_path = os.path.join(seed_dir, filename)
+            for seed in SEEDS:
+                seed_dir = os.path.join(split_root, f"seed_{seed}")
+                os.makedirs(seed_dir, exist_ok=True)
+                out_path = os.path.join(seed_dir, filename)
 
-            image = pipe(
-                prompt=[caption],
-                negative_prompt=[NEGATIVE_PROMPT],
-                cfg_scale=CFG_SCALE,
-                num_inference_steps=NUM_INFERENCE_STEPS,
-                seed=seed,
-                height=HEIGHT,
-                width=WIDTH,
-                eligen_entity_prompts=[entity_prompts],
-                eligen_entity_masks=[masks],
-            )
-            image.save(out_path)
+                image = pipe(
+                    prompt=[caption],
+                    negative_prompt=[NEGATIVE_PROMPT],
+                    cfg_scale=CFG_SCALE,
+                    num_inference_steps=NUM_INFERENCE_STEPS,
+                    seed=seed,
+                    height=HEIGHT,
+                    width=WIDTH,
+                    eligen_entity_prompts=[entity_prompts],
+                    eligen_entity_masks=[masks],
+                )
+                image.save(out_path)
+
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        print("Generation complete.")
+
+
+if __name__ == "__main__":
+    main()
