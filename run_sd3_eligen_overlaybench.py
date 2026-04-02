@@ -16,7 +16,7 @@ from diffsynth.utils import ModelConfig
 # --------------------------
 DATASET_NAME = "cywang143/OverLayBench_Eval"
 SPLITS = ["simple", "medium", "hard"]
-OUTPUT_ROOT = "/mnt/sphere/nvme-backups/luogeng/shivansh/place_object/sd3_eligen_overlaybench"
+OUTPUT_ROOT = "/mnt/sphere/nvme-backups/luogeng/shivansh/place_object/sd3_ours_updated_2_eligen_overlaybench"
 SEEDS = [0]
 HEIGHT = 1024
 WIDTH = 1024
@@ -33,7 +33,7 @@ MODEL_ID_WITH_ORIGIN_PATHS = (
     "AI-ModelScope/stable-diffusion-3-medium:text_encoders/t5xxl_fp16.safetensors"
 )
 LORA_PATH = (
-    "/mnt/sphere/nvme-backups/luogeng/shivansh/place_object/models/sd3_eligen/"
+    "/mnt/sphere/nvme-backups/luogeng/shivansh/place_object/models/train/"
     "SD3-EliGen_lora/step-10000.safetensors"
 )
 

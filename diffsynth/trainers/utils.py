@@ -72,7 +72,7 @@ class TextImageDataset(torch.utils.data.Dataset):
                         bbox_px[0] / norm, bbox_px[1] / norm,
                         bbox_px[2] / norm, bbox_px[3] / norm
                     ]
-                    entities.append({"entity": d["local_prompt"], "bbox": bbox_norm})
+                    entities.append({"entity": d["short_local_prompt"], "bbox": bbox_norm})
                 caption = meta.get("global_caption", "")
                 self.text.append(caption)
                 self.entity_dict[basename] = entities
@@ -107,7 +107,10 @@ class TextImageDataset(torch.utils.data.Dataset):
                 bbox_px[0] / norm, bbox_px[1] / norm,
                 bbox_px[2] / norm, bbox_px[3] / norm
             ]
-            entities.append({"entity": d["local_prompt"], "bbox": bbox_norm})
+            if "short_local_prompt" in d:
+                entities.append({"entity": d["short_local_prompt"], "bbox": bbox_norm})
+            else:
+                return "", []
         caption = meta.get("global_caption", "")
         return caption, entities
 

@@ -130,7 +130,7 @@ for model_config in model_configs:
     model_manager.load_model(model_config.path, device="cuda", torch_dtype=torch.bfloat16)
 
 # Use your trained SD3 EliGen LoRA checkpoint.
-lora_path = "/mnt/sphere/nvme-backups/luogeng/shivansh/place_object/models/train/SD3-EliGen_lora/step-7600.safetensors"
+lora_path = "/mnt/sphere/nvme-backups/luogeng/shivansh/place_object/models/train/SD3-EliGen_lora/step-9200.safetensors"
 model_manager.load_lora(lora_path, lora_alpha=1.0)
 pipe = SD3ImagePipeline.from_model_manager(model_manager)
 
