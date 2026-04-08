@@ -29,7 +29,7 @@ class FluxTrainingModule(DiffusionTrainingModule):
         if model_id_with_origin_paths is not None:
             model_id_with_origin_paths = model_id_with_origin_paths.split(",")
             model_configs += [ModelConfig(model_id=i.split(":")[0], origin_file_pattern=i.split(":")[1]) for i in model_id_with_origin_paths]
-        self.pipe = FluxImagePipeline.from_pretrained(torch_dtype=torch.float32, device="cpu", model_configs=model_configs)
+        self.pipe = FluxImagePipeline.from_pretrained(torch_dtype=torch.bfloat16, device="cpu", model_configs=model_configs)
         
         # Reset training scheduler
         self.pipe.scheduler.set_timesteps(1000, training=True)
