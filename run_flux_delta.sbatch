@@ -20,6 +20,11 @@ conda activate eligen
 cd ~/code/place_object
 mkdir -p logs
 
+# W&B auth: pass WANDB_API_KEY at submit time, e.g.
+# WANDB_API_KEY=xxx sbatch --export=ALL,WANDB_API_KEY run_flux_delta.sbatch
+# : "${WANDB_API_KEY:?WANDB_API_KEY is not set. Export it before submitting this job.}"
+export WANDB_API_KEY
+
 accelerate launch examples/flux/model_training/train.py \
   --dataset_base_path "/work/nvme/bgjw/ddivyansh/hf_cache" \
   --height 1024 \
