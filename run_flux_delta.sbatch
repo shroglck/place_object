@@ -2,9 +2,9 @@
 #SBATCH --job-name=eligen-flux-lora
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gpus-per-node=4
-#SBATCH --cpus-per-task=48
-#SBATCH --mem=96g
+#SBATCH --gpus-per-node=1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=256g
 #SBATCH --time=00:10:00
 #SBATCH --partition=ghx4-interactive
 #SBATCH --account=bgjw-dtai-gh
@@ -38,7 +38,7 @@ accelerate launch examples/flux/model_training/train.py \
   --lora_target_modules "a_to_qkv,b_to_qkv,ff_a.0,ff_a.2,ff_b.0,ff_b.2,a_to_out,b_to_out,proj_out,norm.linear,norm1_a.linear,norm1_b.linear,to_qkv_mlp" \
   --lora_rank 64 \
   --extra_inputs "eligen_entity_masks,eligen_entity_prompts" \
-  --batch_size 16 \
+  --batch_size 2 \
   --lora_alpha 64 \
   --use_gradient_checkpointing \
   --gradient_accumulation_steps 1 \
