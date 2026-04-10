@@ -165,4 +165,10 @@ if __name__ == "__main__":
         find_unused_parameters=args.find_unused_parameters,
         num_workers=args.dataset_num_workers,
         batch_size=args.batch_size,
+        use_wandb=args.use_wandb,
+        wandb_project=args.wandb_project,
+        wandb_run_name=args.wandb_run_name,
+        wandb_entity=args.wandb_entity,
+        wandb_tags=args.wandb_tags.split(",") if args.wandb_tags else None,
+        wandb_mode=args.wandb_mode,
     )

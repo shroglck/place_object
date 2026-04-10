@@ -7,6 +7,8 @@ from accelerate import Accelerator, FullyShardedDataParallelPlugin
 from accelerate.utils import DistributedDataParallelKwargs
 import numpy as np
 
+import wandb
+
 class TextImageDataset(torch.utils.data.Dataset):
     def __init__(self, dataset_base_path, dataset_metadata_path, steps_per_epoch=10000, height=1024, width=1024, center_crop=True, random_flip=False, bbox_norm_size=1024, image_extensions=("jpg", "jpeg", "png"), max_files=None):
         """
@@ -669,6 +671,12 @@ def launch_training_task(
     find_unused_parameters: bool = False,
     batch_size: int = 1,
     clear_cuda_cache_every: int = 0,
+    use_wandb: bool = False,
+    wandb_project: str = None,
+    wandb_run_name: str = None,
+    wandb_entity: str = None,
+    wandb_tags: list = None,
+    wandb_mode: str = "online",
 ):
     # Custom collate function to handle batching
     def collate_fn(batch):
@@ -718,6 +726,23 @@ def launch_training_task(
     with open(epoch_csv_path, "w", newline="") as f:
         f.write("epoch,avg_loss,avg_loss_latent\n")
     
+    if use_wandb and accelerator.is_main_process:
+        run_config = {
+            "num_epochs": num_epochs,
+            "gradient_accumulation_steps": gradient_accumulation_steps,
+            "batch_size": batch_size,
+            "learning_rate": optimizer.param_groups[0]["lr"] if len(optimizer.param_groups) > 0 else None,
+            "save_steps": save_steps,
+        }
+        wandb.init(
+            project=wandb_project or "diffsynth",
+            name=wandb_run_name,
+            entity=wandb_entity,
+            tags=wandb_tags,
+            config=run_config,
+            mode=wandb_mode,
+        )
+
     global_step = 0
     
     for epoch_id in range(num_epochs):
@@ -744,6 +769,16 @@ def launch_training_task(
                 # Update step CSV in real-time
                 with open(step_csv_path, "a", newline="") as f:
                     f.write(f"{global_step},{loss_value},{loss_latent.item()},{scheduler.get_last_lr()[0]}\n")
+                if use_wandb and accelerator.is_main_process:
+                    wandb.log(
+                        {
+                            "train/loss": loss_value,
+                            "train/loss_latent": loss_latent.item(),
+                            "train/lr": scheduler.get_last_lr()[0],
+                            "train/epoch": epoch_id,
+                        },
+                        step=global_step,
+                    )
                 
                 # Update progress bar with current loss
                 avg_loss = sum(epoch_losses) / len(epoch_losses)
@@ -766,11 +801,22 @@ def launch_training_task(
             epoch_avg_loss = sum(epoch_losses) / len(epoch_losses)
             with open(epoch_csv_path, "a", newline="") as f:
                 f.write(f"{epoch_id},{epoch_avg_loss},{epoch_avg_loss_latent}\n")
+            if use_wandb and accelerator.is_main_process:
+                wandb.log(
+                    {
+                        "epoch/avg_loss": epoch_avg_loss,
+                        "epoch/avg_loss_latent": epoch_avg_loss_latent,
+                        "epoch/id": epoch_id,
+                    },
+                    step=global_step,
+                )
         
         if save_steps is None:
             model_logger.on_epoch_end(accelerator, model, epoch_id)
     
     model_logger.on_training_end(accelerator, model, save_steps)
+    if use_wandb and accelerator.is_main_process:
+        wandb.finish()
 
 
 def launch_data_process_task(model: DiffusionTrainingModule, dataset, output_path="./models"):
@@ -855,6 +901,12 @@ def flux_parser():
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay.")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for training.")
     parser.add_argument("--clear_cuda_cache_every", type=int, default=500, help="Clear CUDA cache every N steps to reduce fragmentation (0=disable). Use when OOM with high steps_per_epoch.")
+    parser.add_argument("--use_wandb", default=True, action="store_true", help="Enable Weights & Biases logging.")
+    parser.add_argument("--wandb_project", type=str, default="Eligen", help="W&B project name.")
+    parser.add_argument("--wandb_run_name", type=str, default="overlaydataset-train", help="W&B run name.")
+    parser.add_argument("--wandb_entity", type=str, default=None, help="W&B entity/team.")
+    parser.add_argument("--wandb_tags", type=str, default=None, help="Comma-separated W&B tags.")
+    parser.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline", "disabled"], help="W&B mode.")
     parser.add_argument("--reflow_loss", default=False, action="store_true", help="Whether to use reflow loss.")
     parser.add_argument("--stage_one", default=False, action="store_true", help="Whether to use stage one.")
     parser.add_argument("--stage_one_checkpoint", type=str, default=None, help="Path to the stage one checkpoint. If provided, stage one will be loaded from this checkpoint.")
