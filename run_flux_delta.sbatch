@@ -4,7 +4,7 @@
 #SBATCH --ntasks=1
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=256g
+#SBATCH --mem=96g
 #SBATCH --time=00:10:00
 #SBATCH --partition=ghx4-interactive
 #SBATCH --account=bgjw-dtai-gh

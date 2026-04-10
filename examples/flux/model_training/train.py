@@ -85,6 +85,11 @@ class FluxTrainingModule(DiffusionTrainingModule):
         
         data["eligen_entity_masks"] = eligen_entity_masks
         data["eligen_entity_prompts"] = eligen_entity_prompts
+
+        print("--------------------------------")
+        print(data["eligen_entity_prompts"])
+        print(data["prompt"])
+        print("--------------------------------")
         
         # CFG-unsensitive parameters
         inputs_shared = {
@@ -133,6 +138,7 @@ if __name__ == "__main__":
     parser = flux_parser()
     args = parser.parse_args()
     configure_hf_cache(args.dataset_base_path)
+    print("Data loading started")
     dataset = OverlayDataset(
         split="train",
         cache_dir=os.environ.get("HF_DATASETS_CACHE"),
@@ -140,6 +146,7 @@ if __name__ == "__main__":
         height=args.height,
         width=args.width,
     )
+    print("Data loading completed")
     model = FluxTrainingModule(
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,
@@ -153,14 +160,15 @@ if __name__ == "__main__":
         extra_inputs=args.extra_inputs,
         lora_alpha=args.lora_alpha
     )
+    print("Model loading completed")
     model_logger = ModelLogger(
         args.output_path,
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
         state_dict_converter=FluxLoRAConverter.align_to_opensource_format if args.align_to_opensource_format else lambda x:x,
     )
-
+    print("Model logger loading completed")
     optimizer = torch.optim.AdamW(model.trainable_modules(), lr=args.learning_rate, weight_decay=args.weight_decay, fused=True)
-    
+    print("Optimizer loading completed")
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
     launch_training_task(
         dataset, model, model_logger, optimizer, scheduler,

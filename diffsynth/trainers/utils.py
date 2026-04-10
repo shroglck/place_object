@@ -887,7 +887,14 @@ def launch_training_task(
         for step, data in enumerate(progress_bar):
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
+                print("--------------------------------")
+                print("Step: ", step)
+                print("--------------------------------")
                 loss, loss_latent = model(data)
+                print("--------------------------------")
+                print("Loss: ", loss)
+                print("Loss latent: ", loss_latent)
+                print("--------------------------------")
                 accelerator.backward(loss)
                 trainable_params = accelerator.unwrap_model(model).trainable_modules()
                 accelerator.clip_grad_norm_(trainable_params, max_norm=1.0)
