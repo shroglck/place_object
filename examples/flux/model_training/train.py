@@ -1,10 +1,8 @@
-import torch, os, json, numpy as np
+import torch, os, json
 from diffsynth import load_state_dict
 from diffsynth.pipelines.flux_image_new import FluxImagePipeline, ModelConfig, ControlNetInput
-from diffsynth.trainers.utils import DiffusionTrainingModule, TextImageDataset, ModelLogger, launch_training_task, flux_parser
+from diffsynth.trainers.utils import DiffusionTrainingModule, OverlayDataset, configure_hf_cache, ModelLogger, launch_training_task, flux_parser
 from diffsynth.models.lora import FluxLoRAConverter
-from torch.nn import init
-from safetensors import safe_open
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
@@ -134,7 +132,14 @@ class FluxTrainingModule(DiffusionTrainingModule):
 if __name__ == "__main__":
     parser = flux_parser()
     args = parser.parse_args()
-    dataset = TextImageDataset(dataset_base_path=args.dataset_base_path, dataset_metadata_path=args.dataset_metadata_path, steps_per_epoch=args.steps_per_epoch, height=args.height, width=args.width, center_crop=args.center_crop, random_flip=args.random_flip)
+    configure_hf_cache(args.dataset_base_path)
+    dataset = OverlayDataset(
+        split="train",
+        cache_dir=os.environ.get("HF_DATASETS_CACHE"),
+        local_files_only=True,
+        height=args.height,
+        width=args.width,
+    )
     model = FluxTrainingModule(
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,

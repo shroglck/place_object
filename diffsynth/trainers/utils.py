@@ -6,8 +6,20 @@ from tqdm import tqdm
 from accelerate import Accelerator, FullyShardedDataParallelPlugin
 from accelerate.utils import DistributedDataParallelKwargs
 import numpy as np
-
 import wandb
+
+
+def configure_hf_cache(hf_home_path):
+    if hf_home_path is None or hf_home_path == "":
+        return
+    HF_HOME_PATH = hf_home_path
+    os.environ["HF_HOME"] = HF_HOME_PATH
+    os.environ["HF_DATASETS_CACHE"] = os.path.join(HF_HOME_PATH, "datasets")
+    os.environ["HF_HUB_CACHE"] = os.path.join(HF_HOME_PATH, "hub")
+    os.environ["HUGGINGFACE_HUB_CACHE"] = os.environ["HF_HUB_CACHE"]
+    os.environ["TRANSFORMERS_CACHE"] = os.path.join(HF_HOME_PATH, "transformers")
+    os.environ["HF_HUB_OFFLINE"] = "1"
+
 
 class TextImageDataset(torch.utils.data.Dataset):
     def __init__(self, dataset_base_path, dataset_metadata_path, steps_per_epoch=10000, height=1024, width=1024, center_crop=True, random_flip=False, bbox_norm_size=1024, image_extensions=("jpg", "jpeg", "png"), max_files=None):
@@ -173,6 +185,128 @@ class TextImageDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.path)
 
+
+class OverlayDataset(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        dataset_name="dsrivastavv/overlaydataset",
+        split="train",
+        cache_dir=None,
+        local_files_only=True,
+        height=None,
+        width=None,
+        max_entities=20,
+        global_prompt_key="long_global_caption",
+        local_prompt_key="short_local_prompt",
+    ):
+        from datasets import DownloadConfig, load_dataset
+
+        self.height = height
+        self.width = width
+        self.max_entities = max_entities
+        self.global_prompt_key = global_prompt_key
+        self.local_prompt_key = local_prompt_key
+
+        self.data = load_dataset(
+            dataset_name,
+            split=split,
+            cache_dir=cache_dir,
+            download_mode="reuse_dataset_if_exists",
+            download_config=DownloadConfig(local_files_only=local_files_only),
+        )
+
+    def crop_and_resize(self, image, target_height, target_width):
+        width, height = image.size
+        scale = max(target_width / width, target_height / height)
+        image = torchvision.transforms.functional.resize(
+            image,
+            (round(height * scale), round(width * scale)),
+            interpolation=torchvision.transforms.InterpolationMode.BILINEAR,
+        )
+        image = torchvision.transforms.functional.center_crop(image, (target_height, target_width))
+        return image
+
+    def _pick_global_prompt(self, sample):
+        text = sample.get(self.global_prompt_key)
+        if text:
+            return text
+        if self.global_prompt_key != "short_global_caption" and sample.get("short_global_caption"):
+            return sample["short_global_caption"]
+        return sample.get("long_global_caption", "")
+
+    def _pick_local_prompt(self, obj):
+        text = obj.get(self.local_prompt_key)
+        if text:
+            return text
+        if self.local_prompt_key != "short_local_prompt" and obj.get("short_local_prompt"):
+            return obj["short_local_prompt"]
+        return obj.get("long_local_prompt", "")
+
+    @staticmethod
+    def _normalize_bbox(bbox, image_width, image_height):
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            return None
+        x1, y1, x2, y2 = [float(v) for v in bbox]
+        x1 = max(0.0, min(float(image_width), x1))
+        y1 = max(0.0, min(float(image_height), y1))
+        x2 = max(0.0, min(float(image_width), x2))
+        y2 = max(0.0, min(float(image_height), y2))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return [x1 / image_width, y1 / image_height, x2 / image_width, y2 / image_height]
+
+    @staticmethod
+    def _mask_from_bbox(bbox_norm, target_height, target_width):
+        mask = np.zeros((target_height, target_width, 3), dtype=np.uint8)
+        x1 = int(bbox_norm[0] * target_width)
+        y1 = int(bbox_norm[1] * target_height)
+        x2 = int(bbox_norm[2] * target_width)
+        y2 = int(bbox_norm[3] * target_height)
+        mask[y1:y2, x1:x2, :] = 255
+        return Image.fromarray(mask, mode="RGB")
+
+    def __getitem__(self, index):
+        sample = self.data[index]
+        image = sample["image"].convert("RGB")
+        target_width, target_height = image.size
+        if self.height is not None and self.width is not None:
+            image = self.crop_and_resize(image, self.height, self.width)
+            target_height, target_width = self.height, self.width
+
+        image_width = sample.get("image_width", image.size[0])
+        image_height = sample.get("image_height", image.size[1])
+
+        entity_prompts = []
+        masks = []
+        bboxes = []
+        for obj in sample.get("objects", []):
+            bbox_norm = self._normalize_bbox(obj.get("bbox"), image_width, image_height)
+            if bbox_norm is None:
+                continue
+            entity_prompts.append(self._pick_local_prompt(obj))
+            masks.append(self._mask_from_bbox(bbox_norm, target_height, target_width))
+            bboxes.append(bbox_norm)
+            if len(masks) >= self.max_entities:
+                break
+
+        num_entities = len(masks)
+        while len(masks) < self.max_entities:
+            masks.append(Image.new("RGB", (target_width, target_height), (0, 0, 0)))
+            entity_prompts.append("<pad>")
+            bboxes.append([0.0, 0.0, 0.0, 0.0])
+
+        return {
+            "prompt": self._pick_global_prompt(sample),
+            "image": image,
+            "eligen_entity_masks": masks[: self.max_entities],
+            "eligen_entity_prompts": entity_prompts[: self.max_entities],
+            "eligen_entity_bboxes": bboxes[: self.max_entities],
+            "num_entities": num_entities,
+        }
+
+    def __len__(self):
+        return len(self.data)
+
 # class TextImageDataset(torch.utils.data.Dataset):
 #     def __init__(self, dataset_base_path, dataset_metadata_path, steps_per_epoch=10000, height=1024, width=1024, center_crop=True, random_flip=False):
 #         self.steps_per_epoch = steps_per_epoch
@@ -251,8 +385,8 @@ class TextImageDataset(torch.utils.data.Dataset):
         
 #         return {"prompt": text, "image": image,"eligen_entity_masks":masks[:20],"eligen_entity_prompts":entity_prompts[:20], "num_entities":num_entities}
 
-    def __len__(self):
-        return len(self.path)
+#     def __len__(self):
+#         return len(self.path)
 
 class ImageDataset(torch.utils.data.Dataset):
     def __init__(
