@@ -7,7 +7,7 @@
 #SBATCH --mem=96g
 #SBATCH --time=48:00:00
 #SBATCH --partition=ghx4
-#SBATCH --account=bgjw-dtai-ghu
+#SBATCH --account=bgjw-dtai-gh
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 
