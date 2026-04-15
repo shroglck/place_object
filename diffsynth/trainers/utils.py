@@ -848,6 +848,14 @@ def launch_training_task(
     unwrapped_model = accelerator.unwrap_model(model)
     if hasattr(unwrapped_model, "pipe") and hasattr(unwrapped_model.pipe, "device"):
         unwrapped_model.pipe.device = accelerator.device
+    if hasattr(torch, "compile") and hasattr(unwrapped_model, "pipe") and hasattr(unwrapped_model.pipe, "dit"):
+        # Compile after prepare() so each rank compiles on its final device.
+        unwrapped_model.pipe.dit.forward = torch.compile(
+            unwrapped_model.pipe.dit.forward,
+            mode="default",
+            dynamic=False,
+        )
+        print(f"[rank={accelerator.process_index}] Enabled torch.compile for DiT forward")
 
     # Initialize CSV files for real-time logging
     os.makedirs(model_logger.output_path, exist_ok=True)
@@ -877,6 +885,14 @@ def launch_training_task(
             mode=wandb_mode,
         )
 
+    dit_param = next(accelerator.unwrap_model(model).pipe.dit.parameters())
+    print(
+        f"[pre-loop] accelerator.device={accelerator.device} "
+        f"pipe.device={accelerator.unwrap_model(model).pipe.device} "
+        f"dit.device={dit_param.device} dit.dtype={dit_param.dtype} "
+        f"cuda={torch.cuda.is_available()} count={torch.cuda.device_count()}"
+    )
+
     global_step = 0
     
     for epoch_id in range(num_epochs):
@@ -887,14 +903,7 @@ def launch_training_task(
         for step, data in enumerate(progress_bar):
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
-                print("--------------------------------")
-                print("Step: ", step)
-                print("--------------------------------")
                 loss, loss_latent = model(data)
-                print("--------------------------------")
-                print("Loss: ", loss)
-                print("Loss latent: ", loss_latent)
-                print("--------------------------------")
                 accelerator.backward(loss)
                 trainable_params = accelerator.unwrap_model(model).trainable_modules()
                 accelerator.clip_grad_norm_(trainable_params, max_norm=1.0)
