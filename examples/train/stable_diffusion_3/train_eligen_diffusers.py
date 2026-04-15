@@ -48,6 +48,7 @@ class EligenJointAttnProcessor2_0:
         hidden_states: torch.FloatTensor,
         encoder_hidden_states: torch.FloatTensor = None,
         attention_mask: torch.FloatTensor | None = None,
+        image_rotary_emb: torch.FloatTensor | None = None,
         *args,
         **kwargs,
     ) -> torch.FloatTensor:
@@ -94,6 +95,24 @@ class EligenJointAttnProcessor2_0:
             query = torch.cat([query, encoder_hidden_states_query_proj], dim=2)
             key = torch.cat([key, encoder_hidden_states_key_proj], dim=2)
             value = torch.cat([value, encoder_hidden_states_value_proj], dim=2)
+
+
+        if image_rotary_emb is not None:
+            from diffusers.models.embeddings import apply_rotary_emb
+            query = apply_rotary_emb(query, image_rotary_emb)
+            key = apply_rotary_emb(key, image_rotary_emb)
+
+
+        if image_rotary_emb is not None:
+            from diffusers.models.embeddings import apply_rotary_emb
+            query = apply_rotary_emb(query, image_rotary_emb)
+            key = apply_rotary_emb(key, image_rotary_emb)
+
+
+        if image_rotary_emb is not None:
+            from diffusers.models.embeddings import apply_rotary_emb
+            query = apply_rotary_emb(query, image_rotary_emb)
+            key = apply_rotary_emb(key, image_rotary_emb)
 
         if attention_mask is not None:
             if attention_mask.dim() == 3:
@@ -574,7 +593,7 @@ def main():
                 # Process masks
                 masks = batch["eligen_entity_masks"].to(accelerator.device, dtype=weight_dtype) # [B, N_entities, 1, H, W]
                 # Downsample mask to latent space
-                downsampled_masks = F.interpolate(masks.squeeze(2), size=(model_input.shape[2], model_input.shape[3]), mode='nearest')
+                downsampled_masks = F.interpolate(masks.squeeze(2), size=(model_input.shape[2]//2, model_input.shape[3]//2), mode='nearest')
 
                 # Reshape to [B, N_entities, H*W]
                 downsampled_masks = downsampled_masks.view(bsz, args.max_entities, -1)
@@ -582,10 +601,9 @@ def main():
                 # Create boolean mask
                 attention_mask = construct_mask(
                     [downsampled_masks[:, i, :] for i in range(args.max_entities)],
-                    image_seq_len=model_input.shape[2] * model_input.shape[3],
+                    image_seq_len=(model_input.shape[2] // 2) * (model_input.shape[3] // 2),
                     prompt_seq_len=prompt_embeds.shape[1]
                 )
-
                 # Forward Pass
                 model_pred = transformer(
                     hidden_states=noisy_model_input,
