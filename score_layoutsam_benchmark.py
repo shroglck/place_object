@@ -19,11 +19,11 @@ if __name__ == "__main__":
 
     # evaluation
     dataset_path = "HuiZhang0812/LayoutSAM-eval"
-    test_dataset = load_dataset(dataset_path, split='test')
+    test_dataset = load_dataset(dataset_path, split='test', cache_dir=MODEL_CACHE_DIR)
     test_dataset = BboxDataset(test_dataset)
     test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=1)
 
-    generate_path = "/mnt/sphere/nvme-backups/luogeng/shivansh/place_object/ours_layoutsam_eval/test/seed_0"   
+    generate_path = "/mnt/sphere/nvme-backups/luogeng/shivansh/layout2img/layoutsam_eval/test/seed_0"   
     print("processing:",generate_path)
 
     save_json_path = generate_path.replace("test/seed_0", "minicpm-vqa.json")

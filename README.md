@@ -18,8 +18,9 @@ This README shows how to start EliGen LoRA training with:
 Run from the project root:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 accelerate launch examples/flux/model_training/train.py \
-  --dataset_base_path "/mnt/ultracube/datasets/overlaydataset" \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 accelerate launch examples/flux/model_training/train.py \
+  --dataset_base_path "/mnt/ultracube/shivansh/OverlapScenesDataset/images" \
+  --dataset_metadata_path "/mnt/ultracube/shivansh/OverlapScenesDataset/metadata" \
   --height 1024 \
   --width 1024 \
   --model_id_with_origin_paths "black-forest-labs/FLUX.1-dev:flux1-dev.safetensors,black-forest-labs/FLUX.1-dev:text_encoder/model.safetensors,black-forest-labs/FLUX.1-dev:text_encoder_2/,black-forest-labs/FLUX.1-dev:ae.safetensors" \
@@ -29,12 +30,12 @@ CUDA_VISIBLE_DEVICES=0,1 accelerate launch examples/flux/model_training/train.py
   --output_path "./models/train/FLUX.1-dev-EliGen_lora" \
   --lora_base_model "dit" \
   --lora_target_modules "a_to_qkv,b_to_qkv,ff_a.0,ff_a.2,ff_b.0,ff_b.2,a_to_out,b_to_out,proj_out,norm.linear,norm1_a.linear,norm1_b.linear,to_qkv_mlp" \
-  --lora_rank 16 \
+  --lora_rank 64 \
   --extra_inputs "eligen_entity_masks,eligen_entity_prompts" \
-  --batch_size 2 \
-  --lora_alpha 16 \
+  --batch_size 1 \
+  --lora_alpha 64 \
   --use_gradient_checkpointing \
-  --gradient_accumulation_steps 1 \
+  --gradient_accumulation_steps 4 \
   --save_steps 100
 ```
 

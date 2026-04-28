@@ -1,13 +1,10 @@
 import random
 import torch
 from PIL import Image, ImageDraw, ImageFont
-from diffsynth import download_customized_models
 from diffsynth.pipelines.flux_image_new import FluxImagePipeline, ModelConfig
 from safetensors import safe_open
 from modelscope import dataset_snapshot_download
 import numpy as np
-from skimage import measure
-from skimage.measure import regionprops
 
 def visualize_masks(image, masks, mask_prompts, output_path, font_size=35, use_random_colors=False):
     # Create a blank image for overlays
@@ -66,53 +63,34 @@ def visualize_masks(image, masks, mask_prompts, output_path, font_size=35, use_r
 
     return result
 
-def get_bboxes_from_mask(mask):
-    """
-    Extract bounding boxes from a binary mask.
-    
-    Args:
-        mask: A binary mask (2D numpy array where objects are 1, background is 0)
-        
-    Returns:
-        List of bounding boxes in format [x_min, y_min, x_max, y_max]
-    """
-    # Ensure mask is binary
-    if mask.dtype != bool:
-        mask = mask > 0
-    mask = mask[:,:,0]
-    # Label connected regions in the mask
-    labeled_mask = measure.label(mask, connectivity=2)
-    
-    # Extract properties for each labeled region
-    regions = regionprops(labeled_mask)
-    
-    # Extract bounding boxes
-    bboxes = []
-    for region in regions:
-        # regionprops returns bbox as (min_row, min_col, max_row, max_col)
-        # Convert to (min_col, min_row, max_col, max_row) which is (x_min, y_min, x_max, y_max)
-        y_min, x_min, y_max, x_max = region.bbox
-        bboxes.append([x_min, y_min, x_max, y_max])
-    return bboxes
-
-def example(pipe, seeds, example_id, global_prompt, entity_prompts):
-    dataset_snapshot_download(dataset_id="DiffSynth-Studio/examples_in_diffsynth", local_dir="./", allow_file_pattern=f"data/examples/eligen/entity_control/example_{example_id}/*.png")
-    masks = [[Image.open(f"./data/examples/eligen/entity_control/example_{example_id}/{i}.png").convert('RGB') for i in range(len(entity_prompts[0]))]]
-    negative_prompt = ["worst quality, low quality, monochrome, zombie, interlocked fingers, Aissist, cleavage, nsfw,"]
-
-    bboxes = [torch.tensor(get_bboxes_from_mask(np.array(mask)))/1024 for mask in masks[0]]
-    target_height, target_width = 1024, 1024
+def create_masks_from_bboxes(bboxes, image_size=(1024, 1024)):
     masks = []
-    for i in bboxes:
-        mask = np.zeros((target_height,target_width,3))
-        mask[int(i[0][1]*target_height):int(i[0][3]*target_height),int(i[0][0]*target_width):int(i[0][2]*target_width),:] = 255.0
-        masks.append(Image.fromarray(mask.astype(np.uint8)))
+    for bbox in bboxes:
+        mask = Image.new("RGB", image_size, (0, 0, 0))
+        draw = ImageDraw.Draw(mask)
+        draw.rectangle(bbox, fill=(255, 255, 255))
+        masks.append(mask)
+    return masks
 
-    masks = [masks]
-    bboxes = [bbox[0] for bbox in bboxes]
-    
+
+def run_example(pipe, seeds, example_id, global_prompt, entity_prompts, masks=None, visualization_prompts=None):
+    if masks is None:
+        dataset_snapshot_download(
+            dataset_id="DiffSynth-Studio/examples_in_diffsynth",
+            local_dir="./",
+            allow_file_pattern=f"data/examples/eligen/entity_control/example_{example_id}/*.png",
+        )
+        masks = [
+            Image.open(f"./data/examples/eligen/entity_control/example_{example_id}/{i}.png").convert("RGB")
+            for i in range(len(entity_prompts))
+        ]
+    global_prompt = [global_prompt]
+
+    if visualization_prompts is None:
+        visualization_prompts = entity_prompts
+
+    negative_prompt = ["worst quality, low quality, monochrome, zombie, interlocked fingers, Aissist, cleavage, nsfw,"]
     for seed in seeds:
-        # generate image
         image = pipe(
             prompt=global_prompt,
             cfg_scale=3.0,
@@ -122,13 +100,16 @@ def example(pipe, seeds, example_id, global_prompt, entity_prompts):
             seed=seed,
             height=1024,
             width=1024,
-            eligen_entity_prompts=entity_prompts,
-            eligen_entity_masks=masks,
-            # eligen_entity_bboxes=bboxes,
-            # eligen_enable_on_negative=True,
+            eligen_entity_prompts=[entity_prompts],
+            eligen_entity_masks=[masks],
         )
         image.save(f"eligen_example_{example_id}_{seed}.png")
-        visualize_masks(image, masks[0], entity_prompts[0], f"eligen_example_{example_id}_mask_{seed}.png")
+        visualize_masks(
+            image,
+            masks,
+            visualization_prompts,
+            f"eligen_example_{example_id}_mask_{seed}.png",
+        )
 
 pipe = FluxImagePipeline.from_pretrained(
     torch_dtype=torch.bfloat16,
@@ -141,54 +122,162 @@ pipe = FluxImagePipeline.from_pretrained(
     ],
 )
 
-LORA_path = "models/train/FLUX.1-dev-EliGen_lora/step-100.safetensors"
+LORA_path = "/mnt/sphere/nvme-backups/luogeng/shivansh/place_object/models/flux_hf/trainable_checkpoints/step-6600.safetensors"
 lora_state_dict = dict()
-bbox_state_dict = dict()
+# bbox_state_dict = dict()
 
 with safe_open(LORA_path, framework="pt") as f:
     for key in f.keys():
-        if "bbox" in key or "_c" in key or "c_" in key:
-            bbox_state_dict[key] = f.get_tensor(key)
-        else:
-            lora_state_dict[key] = f.get_tensor(key)
+        lora_state_dict[key.replace("_orig_mod.", "")] = f.get_tensor(key)
 
-load_result = pipe.dit.load_state_dict(bbox_state_dict, strict=False)
-if len(load_result[1]) > 0:
-    print(f"Warning, LoRA key mismatch! Unexpected keys in LoRA checkpoint: {load_result[1]}")
+# load_result = pipe.dit.load_state_dict(bbox_state_dict, strict=False)
+# if len(load_result[1]) > 0:
+#     print(f"Warning, LoRA key mismatch! Unexpected keys in LoRA checkpoint: {load_result[1]}")
 
 pipe.load_lora(pipe.dit, state_dict=lora_state_dict, alpha=1.0)
 
 # example 1
-global_prompt = ["A breathtaking beauty of Raja Ampat by the late-night moonlight , one beautiful woman from behind wearing a pale blue long dress with soft glow, sitting at the top of a cliff looking towards the beach,pastell light colors, a group of small distant birds flying in far sky, a boat sailing on the sea, best quality, realistic, whimsical, fantastic, splash art, intricate detailed, hyperdetailed, maximalist style, photorealistic, concept art, sharp focus, harmony, serenity, tranquility, soft pastell colors,ambient occlusion, cozy ambient lighting, masterpiece, liiv1, linquivera, metix, mentixis, masterpiece, award winning, view from above\n"]
-entity_prompts = [["cliff", "sea", "moon", "sailing boat", "a seated beautiful woman", "pale blue long dress with soft glow"]]
-example(pipe, [0], 1, global_prompt, entity_prompts)
+global_prompt = "A breathtaking beauty of Raja Ampat by the late-night moonlight , one beautiful woman from behind wearing a pale blue long dress with soft glow, sitting at the top of a cliff looking towards the beach,pastell light colors, a group of small distant birds flying in far sky, a boat sailing on the sea, best quality, realistic, whimsical, fantastic, splash art, intricate detailed, hyperdetailed, maximalist style, photorealistic, concept art, sharp focus, harmony, serenity, tranquility, soft pastell colors,ambient occlusion, cozy ambient lighting, masterpiece, liiv1, linquivera, metix, mentixis, masterpiece, award winning, view from above"
+entity_prompts = ["cliff", "sea", "moon", "sailing boat", "a seated beautiful woman", "pale blue long dress with soft glow"]
+run_example(pipe, [0], 1, global_prompt, entity_prompts)
 
 # example 2
-global_prompt = ["samurai girl wearing a kimono, she's holding a sword  glowing with red flame, her long hair is flowing in the wind, she is looking at a small bird perched on the back of her hand. ultra realist style. maximum image detail. maximum realistic render."]
-entity_prompts = [["flowing hair", "sword glowing with red flame", "A cute bird", "blue belt"]]
-example(pipe, [0], 2, global_prompt, entity_prompts)
+global_prompt = "samurai girl wearing a kimono, she's holding a sword  glowing with red flame, her long hair is flowing in the wind, she is looking at a small bird perched on the back of her hand. ultra realist style. maximum image detail. maximum realistic render."
+entity_prompts = ["flowing hair", "sword glowing with red flame", "A cute bird", "blue belt"]
+run_example(pipe, [0], 2, global_prompt, entity_prompts)
 
 # example 3
-global_prompt = ["Image of a neverending staircase up to a mysterious palace in the sky, The ancient palace stood majestically atop a mist-shrouded mountain, sunrise, two traditional monk walk in the stair looking at the sunrise, fog,see-through, best quality, whimsical, fantastic, splash art, intricate detailed, hyperdetailed, photorealistic, concept art, harmony, serenity, tranquility, ambient occlusion, halation, cozy ambient lighting, dynamic lighting,masterpiece, liiv1, linquivera, metix, mentixis, masterpiece, award winning,"]
-entity_prompts = [["ancient palace", "stone staircase with railings", "a traditional monk", "a traditional monk"]]
-example(pipe, [27], 3, global_prompt, entity_prompts)
+global_prompt = "Image of a neverending staircase up to a mysterious palace in the sky, The ancient palace stood majestically atop a mist-shrouded mountain, sunrise, two traditional monk walk in the stair looking at the sunrise, fog,see-through, best quality, whimsical, fantastic, splash art, intricate detailed, hyperdetailed, photorealistic, concept art, harmony, serenity, tranquility, ambient occlusion, halation, cozy ambient lighting, dynamic lighting,masterpiece, liiv1, linquivera, metix, mentixis, masterpiece, award winning,"
+entity_prompts = ["ancient palace", "stone staircase with railings", "a traditional monk", "a traditional monk"]
+run_example(pipe, [27], 3, global_prompt, entity_prompts)
 
 # example 4
-global_prompt = ["A beautiful girl wearing shirt and shorts in the street,  holding a sign 'Entity Control'"]
-entity_prompts = [["A beautiful girl", "sign 'Entity Control'", "shorts", "shirt"]]
-example(pipe, [21], 4, global_prompt, entity_prompts)
+global_prompt = "A beautiful girl wearing shirt and shorts in the street,  holding a sign 'Entity Control'"
+entity_prompts = ["A beautiful girl", "sign 'Entity Control'", "shorts", "shirt"]
+run_example(pipe, [21], 4, global_prompt, entity_prompts)
 
 # example 5
-global_prompt = ["A captivating, dramatic scene in a painting that exudes mystery and foreboding. A white sky, swirling blue clouds, and a crescent yellow moon illuminate a solitary woman standing near the water's edge. Her long dress flows in the wind, silhouetted against the eerie glow. The water mirrors the fiery sky and moonlight, amplifying the uneasy atmosphere."]
-entity_prompts = [["crescent yellow moon", "a solitary woman", "water", "swirling blue clouds"]]
-example(pipe, [0], 5, global_prompt, entity_prompts)
+global_prompt = "A captivating, dramatic scene in a painting that exudes mystery and foreboding. A white sky, swirling blue clouds, and a crescent yellow moon illuminate a solitary woman standing near the water's edge. Her long dress flows in the wind, silhouetted against the eerie glow. The water mirrors the fiery sky and moonlight, amplifying the uneasy atmosphere."
+entity_prompts = ["crescent yellow moon", "a solitary woman", "water", "swirling blue clouds"]
+run_example(pipe, [0], 5, global_prompt, entity_prompts)
 
 # example 6
-global_prompt = ["Snow White and the 6 Dwarfs."]
-entity_prompts = [["Dwarf 1", "Dwarf 2", "Dwarf 3", "Snow White", "Dwarf 4", "Dwarf 5", "Dwarf 6"]]
-example(pipe, [8], 6, global_prompt, entity_prompts)
+global_prompt = "Snow White and the 6 Dwarfs."
+entity_prompts = ["Dwarf 1", "Dwarf 2", "Dwarf 3", "Snow White", "Dwarf 4", "Dwarf 5", "Dwarf 6"]
+run_example(pipe, [8], 6, global_prompt, entity_prompts)
 
 # example 7, same prompt with different seeds
-global_prompt = ["A beautiful woman wearing white dress, holding a mirror, with a warm light background;"]
-entity_prompts = [["A beautiful woman", "mirror", "necklace", "glasses", "earring", "white dress", "jewelry headpiece"]]
-example(pipe, [0], 7, global_prompt, entity_prompts)
+global_prompt = "A beautiful woman wearing white dress, holding a mirror, with a warm light background;"
+entity_prompts = ["A beautiful woman", "mirror", "necklace", "glasses", "earring", "white dress", "jewelry headpiece"]
+run_example(pipe, [0], 7, global_prompt, entity_prompts)
+
+# example 8, truck scene with masks generated from bbox annotations
+global_prompt = "A vibrant orange pickup truck is seen driving along a rural road, surrounded by lush greenery and palm trees. The back of the truck is loaded with large sacks and bags, secured with ropes, suggesting it might be transporting goods or materials. Four individuals are visible in the truck: two seated in the cab and two standing on the roof rack, all smiling and looking towards the camera. The scene captures a moment of everyday life, possibly in a tropical or subtropical region, emphasizing themes of community, work, and the beauty of nature."
+entity_prompts = [
+    "An orange truck carrying sacks and people on its roof and bed.",
+    "A man wearing an orange shirt sitting in the back of the truck.",
+    "A man with curly hair sitting in the back of the truck.",
+    "A man standing on the roof of the truck.",
+    "A man wearing a red shirt standing on the roof of the truck.",
+    "A man wearing an orange t-shirt standing on the roof of the truck.",
+]
+visualization_prompts = [
+    "orange truck",
+    "orange shirt man",
+    "curly hair man",
+    "roof man",
+    "red shirt man",
+    "orange t-shirt man",
+]
+bboxes = [
+    [123, 348, 847, 940],  # orange_truck
+    [526, 441, 670, 636],  # man_in_orange_shirt
+    [201, 456, 302, 570],  # man_with_curly_hair
+    [427, 220, 502, 284],  # man_on_roof
+    [500, 217, 568, 304],  # man_in_red_shirt
+    [575, 188, 689, 341],  # man_in_orange_tshirt
+]
+masks = create_masks_from_bboxes(bboxes, image_size=(1024, 1024))
+run_example(
+    pipe,
+    [0],
+    8,
+    global_prompt,
+    entity_prompts,
+    masks=masks,
+    visualization_prompts=visualization_prompts,
+)
+
+# example 9, kitchen scene with masks generated from bbox annotations
+global_prompt = "This image showcases a well-organized and functional kitchen with light wooden cabinets and a white refrigerator positioned against the wall. The countertop is made of a speckled granite material, providing ample space for various kitchen items such as a microwave, a kettle, and some cleaning supplies. A white electric stove with four burners is situated on the left side, accompanied by a dishwasher below it. The kitchen features a sink with a modern faucet, and the flooring consists of light wood planks that complement the overall warm and inviting aesthetic of the room. The lighting is bright, likely from overhead fluorescent lights, which illuminate the entire space evenly."
+entity_prompts = [
+    "A white electric stove with four burners and an oven below it.",
+    "A tall white refrigerator with a freezer on top.",
+    "A stainless steel sink with a faucet.",
+    "A white dishwasher built into the countertop.",
+    "A black microwave oven sitting on the countertop.",
+    "Lower wooden cabinets with light beige finish.",
+]
+visualization_prompts = [
+    "stove",
+    "refrigerator",
+    "sink",
+    "dishwasher",
+    "microwave",
+    "cabinet",
+]
+bboxes = [
+    [93, 534, 387, 1006],   # stove
+    [592, 378, 857, 919],   # refrigerator
+    [732, 642, 926, 686],   # sink
+    [12, 735, 286, 1024],   # dishwasher
+    [218, 540, 328, 613],   # microwave
+    [685, 660, 832, 1024],  # cabinet
+]
+masks = create_masks_from_bboxes(bboxes, image_size=(1024, 1024))
+run_example(
+    pipe,
+    [0],
+    9,
+    global_prompt,
+    entity_prompts,
+    masks=masks,
+    visualization_prompts=visualization_prompts,
+)
+
+# example 10, bathroom scene with masks generated from bbox annotations
+global_prompt = "A neatly organized bathroom corner featuring a wooden shelf unit placed over a toilet. The top shelf holds a potted plant and several bottles of toiletries, while the middle shelf contains neatly folded towels and additional bottles. The bottom shelf is home to storage boxes labeled \"Swim\" and \"Relax.\" To the left, a pedestal sink with a modern faucet is visible, accompanied by a soap dispenser. A window above the sink allows natural light to brighten the space, and a towel rack with a roll of paper towels is mounted on the wall to the right. The overall aesthetic is clean, minimalistic, and functional."
+entity_prompts = [
+    "A wooden shelf with three tiers placed above a toilet, holding various bathroom items such as bottles, towels, and boxes.",
+    "A white toilet with a closed lid, positioned under a wooden shelf.",
+    "A white pedestal sink with a silver faucet, located next to a window.",
+    "A window with a white frame, allowing natural light into the bathroom.",
+    "A white towel rack mounted on the wall beside the toilet.",
+    "A white toilet paper holder attached to the wall near the towel rack.",
+]
+visualization_prompts = [
+    "shelf",
+    "toilet",
+    "sink",
+    "window",
+    "rack",
+    "holder",
+]
+bboxes = [
+    [384, 150, 786, 1024],  # shelf
+    [465, 633, 775, 1024],  # toilet
+    [0, 609, 337, 1024],    # sink
+    [0, 0, 374, 362],       # window
+    [898, 0, 1024, 990],    # rack
+    [802, 765, 896, 853],   # holder
+]
+masks = create_masks_from_bboxes(bboxes, image_size=(1024, 1024))
+run_example(
+    pipe,
+    [0],
+    10,
+    global_prompt,
+    entity_prompts,
+    masks=masks,
+    visualization_prompts=visualization_prompts,
+)

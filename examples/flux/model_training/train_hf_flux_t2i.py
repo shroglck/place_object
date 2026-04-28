@@ -1,13 +1,13 @@
 import json
 import math
 import os
-import time
 
 import torch
+import wandb
+from safetensors.torch import save_file
 from transformers import Trainer, TrainerCallback, TrainingArguments
 
 from diffsynth import load_state_dict
-from diffsynth.models.lora import FluxLoRAConverter
 from diffsynth.pipelines.flux_image_new import ControlNetInput, FluxImagePipeline, ModelConfig
 from diffsynth.trainers.utils import DiffusionTrainingModule, TextImageDataset, configure_hf_cache, flux_parser
 
@@ -34,6 +34,39 @@ class CudaCacheClearCallback(TrainerCallback):
                 torch.cuda.empty_cache()
 
 
+class SaveTrainableCheckpointCallback(TrainerCallback):
+    def __init__(self, save_every: int, output_dir: str, remove_prefix: str):
+        self.save_every = max(1, int(save_every))
+        self.output_dir = output_dir
+        self.remove_prefix = remove_prefix
+
+    @staticmethod
+    def _unwrap_model(model):
+        return model.module if hasattr(model, "module") else model
+
+    def _save_trainable_checkpoint(self, model, step: int):
+        base_model = self._unwrap_model(model)
+        state_dict = base_model.state_dict()
+        trainable_state_dict = base_model.export_trainable_state_dict(
+            state_dict, remove_prefix=self.remove_prefix
+        )
+        trainable_state_dict = {
+            name: param.detach().cpu().contiguous() for name, param in trainable_state_dict.items()
+        }
+        os.makedirs(self.output_dir, exist_ok=True)
+        ckpt_path = os.path.join(self.output_dir, f"step-{step}.safetensors")
+        save_file(trainable_state_dict, ckpt_path)
+        print(f"Saved trainable checkpoint: {ckpt_path}")
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if not state.is_world_process_zero:
+            return
+        if state.global_step > 0 and (state.global_step % self.save_every) == 0:
+            model = kwargs.get("model", None)
+            if model is not None:
+                self._save_trainable_checkpoint(model, state.global_step)
+
+
 class FluxHFTrainerModule(DiffusionTrainingModule):
     def __init__(
         self,
@@ -48,6 +81,8 @@ class FluxHFTrainerModule(DiffusionTrainingModule):
         use_gradient_checkpointing_offload=False,
         extra_inputs=None,
         lora_alpha=None,
+        torch_compile=False,
+        torch_compile_mode=None,
         torch_dtype=torch.bfloat16,
     ):
         super().__init__()
@@ -81,7 +116,10 @@ class FluxHFTrainerModule(DiffusionTrainingModule):
                 raise ValueError("lora_checkpoint requires lora_base_model to be set.")
             state_dict = load_state_dict(lora_checkpoint)
             state_dict = self.mapping_lora_state_dict(state_dict)
-            load_result = model.load_state_dict(state_dict, strict=False)
+            lora_state_dict = dict()
+            for key in state_dict.keys():
+                lora_state_dict[key.replace("_orig_mod.", "")] = state_dict[key]
+            load_result = model.load_state_dict(lora_state_dict, strict=False)
             print(f"LoRA checkpoint loaded: {lora_checkpoint}, total {len(state_dict)} keys")
             if len(load_result[1]) > 0:
                 print(f"Warning, LoRA key mismatch! Unexpected keys in LoRA checkpoint: {load_result[1]}")
@@ -96,6 +134,27 @@ class FluxHFTrainerModule(DiffusionTrainingModule):
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.use_gradient_checkpointing_offload = use_gradient_checkpointing_offload
         self.extra_inputs = extra_inputs.split(",") if extra_inputs is not None else []
+        self.torch_compile = torch_compile
+        self.torch_compile_mode = torch_compile_mode
+        self._torch_compile_done = False
+
+    def maybe_compile_dit(self):
+        if not self.torch_compile or self._torch_compile_done:
+            return
+        if not hasattr(torch, "compile"):
+            raise RuntimeError("torch.compile is not available in this PyTorch build.")
+
+        first_param = next(self.pipe.dit.parameters(), None)
+        if first_param is None or first_param.device.type != "cuda":
+            # Wait until Trainer/Accelerate moves model to GPU.
+            return
+
+        compile_kwargs = {}
+        if self.torch_compile_mode is not None:
+            compile_kwargs["mode"] = self.torch_compile_mode
+        self.pipe.dit = torch.compile(self.pipe.dit, **compile_kwargs)
+        self._torch_compile_done = True
+        print(f"Enabled torch.compile for DiT on {first_param.device} with kwargs={compile_kwargs}")
 
     def forward_preprocess(self, data):
         inputs_posi = {"prompt": data["prompt"]}
@@ -147,6 +206,7 @@ class FluxHFTrainerModule(DiffusionTrainingModule):
         return {"loss": loss, "loss_latent": loss_latent.detach()}
 
     def compute_losses(self, data):
+        self.maybe_compile_dit()
         inputs = self.forward_preprocess(data)
         models = {name: getattr(self.pipe, name) for name in self.pipe.in_iteration_models}
         loss, loss_latent = self.pipe.training_loss(**models, **inputs)
@@ -154,20 +214,9 @@ class FluxHFTrainerModule(DiffusionTrainingModule):
 
 
 class FluxHFTrainer(Trainer):
-    def __init__(self, *args, print_step_timing: bool = False, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.print_step_timing = bool(print_step_timing)
-
-    @staticmethod
-    def _sync_cuda_if_needed():
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         base_model = model.module if hasattr(model, "module") else model
         loss, loss_latent = base_model.compute_losses(inputs)
-        if self.args.local_rank in (-1, 0):
-            self.log({"loss_latent": loss_latent.detach().item()})
         if return_outputs:
             return loss, {"loss_latent": loss_latent.detach()}
         return loss
@@ -176,32 +225,31 @@ class FluxHFTrainer(Trainer):
         model.train()
         inputs = self._prepare_inputs(inputs)
 
-        self._sync_cuda_if_needed()
-        forward_start = time.perf_counter()
         with self.compute_loss_context_manager():
             if self.model_accepts_loss_kwargs:
-                loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
+                loss, loss_outputs = self.compute_loss(
+                    model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch
+                )
             else:
-                loss = self.compute_loss(model, inputs)
-        self._sync_cuda_if_needed()
-        forward_time = time.perf_counter() - forward_start
+                loss, loss_outputs = self.compute_loss(model, inputs, return_outputs=True)
 
         if self.args.n_gpu > 1:
             loss = loss.mean()
 
+        loss_for_logging = loss.detach().float().item()
+        loss_latent_for_logging = loss_outputs["loss_latent"].detach().float().item()
+
         if not self.model_accepts_loss_kwargs and self.compute_loss_func is None:
             loss = loss / self.args.gradient_accumulation_steps
-        self._sync_cuda_if_needed()
-        backward_start = time.perf_counter()
         self.accelerator.backward(loss)
-        self._sync_cuda_if_needed()
-        backward_time = time.perf_counter() - backward_start
 
-        if self.print_step_timing and self.accelerator.is_local_main_process:
-            print(
-                f"[timing] step={self.state.global_step} "
-                f"forward={forward_time:.4f}s backward={backward_time:.4f}s"
-            )
+        # Log on every optimizer step to ensure W&B visibility.
+        if self.accelerator.sync_gradients and self.is_world_process_zero():
+            next_global_step = self.state.global_step + 1
+            logs = {"train/loss": loss_for_logging, "train/loss_latent": loss_latent_for_logging}
+            self.log(logs)
+            if wandb.run is not None:
+                wandb.log(logs, step=next_global_step)
 
         return loss.detach()
 
@@ -249,9 +297,16 @@ def parse_args():
     parser.add_argument("--fp16", action="store_true")
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument(
-        "--print_step_timing",
+        "--torch_compile",
+        default=False,
         action="store_true",
-        help="Print forward/backward time per training step.",
+        help="Enable torch.compile on the DiT model for potentially faster training.",
+    )
+    parser.add_argument(
+        "--torch_compile_mode",
+        type=str,
+        default=None,
+        help="Optional torch.compile mode, e.g. default, reduce-overhead, max-autotune.",
     )
     return parser.parse_args()
 
@@ -305,6 +360,8 @@ def main():
         use_gradient_checkpointing_offload=args.use_gradient_checkpointing_offload,
         extra_inputs=args.extra_inputs,
         lora_alpha=args.lora_alpha,
+        torch_compile=args.torch_compile,
+        torch_compile_mode=args.torch_compile_mode,
         torch_dtype=torch_dtype,
     )
 
@@ -323,8 +380,8 @@ def main():
             f"effective_global_batch={effective_global_batch}"
         )
 
-    save_strategy = "steps" if args.save_steps is not None else "epoch"
-    save_steps = args.save_steps if args.save_steps is not None else 500
+    save_steps = args.save_steps if args.save_steps is not None else 100
+    save_strategy = "no"
 
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -340,8 +397,6 @@ def main():
         dataloader_num_workers=args.dataset_num_workers,
         logging_steps=args.logging_steps,
         save_strategy=save_strategy,
-        save_steps=save_steps,
-        save_total_limit=3,
         max_grad_norm=args.max_grad_norm,
         remove_unused_columns=False,
         report_to=["wandb"] if args.use_wandb else [],
@@ -351,22 +406,31 @@ def main():
         fp16=args.fp16,
     )
 
+    callbacks = [CudaCacheClearCallback(args.clear_cuda_cache_every)]
+    callbacks.append(
+        SaveTrainableCheckpointCallback(
+            save_every=save_steps,
+            output_dir=os.path.join(args.output_path, "trainable_checkpoints"),
+            remove_prefix=args.remove_prefix_in_ckpt,
+        )
+    )
+
     trainer = FluxHFTrainer(
         model=model,
         args=training_args,
         train_dataset=dataset,
         data_collator=collate_fn,
-        callbacks=[CudaCacheClearCallback(args.clear_cuda_cache_every)],
-        print_step_timing=args.print_step_timing,
+        callbacks=callbacks,
     )
     trainer.train()
 
     os.makedirs(os.path.join(args.output_path, "final"), exist_ok=True)
     state_dict = model.state_dict()
     trainable_state_dict = model.export_trainable_state_dict(state_dict, remove_prefix=args.remove_prefix_in_ckpt)
-    if args.align_to_opensource_format:
-        trainable_state_dict = FluxLoRAConverter.align_to_opensource_format(trainable_state_dict)
-    torch.save(trainable_state_dict, os.path.join(args.output_path, "final", "lora_trainable_only.pt"))
+    trainable_state_dict = {
+        name: param.detach().cpu().contiguous() for name, param in trainable_state_dict.items()
+    }
+    save_file(trainable_state_dict, os.path.join(args.output_path, "final", "lora_trainable_only.safetensors"))
 
 
 if __name__ == "__main__":
